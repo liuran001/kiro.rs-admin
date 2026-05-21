@@ -2,16 +2,16 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -24,8 +24,27 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+use crate::anthropic::cache;
+
+/// 从 HeaderMap 中提取 API Key（用于缓存隔离）
+fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return key.to_string();
+    }
+    if let Some(key) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return key.to_string();
+    }
+    "anonymous".to_string()
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -65,6 +84,31 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+/// 计算 Anthropic usage 口径的 input_tokens（未缓存部分）
+fn compute_uncached_input_tokens(
+    total_input_tokens: i32,
+    cache_creation_input_tokens: i32,
+    cache_read_input_tokens: i32,
+) -> i32 {
+    (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
+}
+
+fn resolve_usage_input_tokens(
+    fallback_total_input_tokens: i32,
+    context_total_input_tokens: Option<i32>,
+    cache_result: &cache::CacheResult,
+) -> i32 {
+    if cache_result.cache_creation_input_tokens > 0 || cache_result.cache_read_input_tokens > 0 {
+        return cache_result.uncached_input_tokens;
+    }
+
+    compute_uncached_input_tokens(
+        context_total_input_tokens.unwrap_or(fallback_total_input_tokens),
+        cache_result.cache_creation_input_tokens,
+        cache_result.cache_read_input_tokens,
+    )
 }
 
 /// GET /v1/models
@@ -195,6 +239,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -282,13 +327,28 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 提取 API key（用于缓存隔离）
+    let api_key = extract_api_key_from_headers(&headers);
+
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 计算缓存断点并查询 Redis
+    let cache_result = if cache::is_redis_available() {
+        let breakpoints =
+            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
+        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
+    } else {
+        cache::CacheResult {
+            uncached_input_tokens: total_input_tokens,
+            ..Default::default()
+        }
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -305,15 +365,25 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            total_input_tokens,
             thinking_enabled,
             tool_name_map,
+            cache_result,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            total_input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_result,
+        )
+        .await
     }
 }
 
@@ -325,6 +395,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_result: cache::CacheResult,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -333,7 +404,11 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = if cache::is_redis_available() {
+        StreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map)
+    } else {
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
+    };
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -461,6 +536,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    cache_result: cache::CacheResult,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -523,14 +599,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -549,10 +625,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -617,8 +692,9 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
+    let final_input_tokens =
+        resolve_usage_input_tokens(input_tokens, context_input_tokens, &cache_result);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -631,7 +707,9 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_result.cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_result.cache_read_input_tokens
         }
     });
 
@@ -649,14 +727,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -668,7 +742,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -707,6 +781,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -795,13 +870,28 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    // 提取 API key（用于缓存隔离）
+    let api_key = extract_api_key_from_headers(&headers);
+
+    // 计算总 input tokens
+    let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+
+    // 计算缓存断点并查询 Redis
+    let cache_result = if cache::is_redis_available() {
+        let breakpoints =
+            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
+        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
+    } else {
+        cache::CacheResult {
+            uncached_input_tokens: total_input_tokens,
+            ..Default::default()
+        }
+    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -818,7 +908,7 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            cache_result,
             thinking_enabled,
             tool_name_map,
         )
@@ -826,7 +916,16 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            total_input_tokens,
+            extract_thinking,
+            tool_name_map,
+            cache_result,
+        )
+        .await
     }
 }
 
@@ -838,7 +937,7 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    estimated_input_tokens: i32,
+    cache_result: cache::CacheResult,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
@@ -849,7 +948,8 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx =
+        BufferedStreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
