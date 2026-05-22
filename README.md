@@ -41,7 +41,7 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **多模型支持**: Sonnet / Opus / Haiku 全系列，**Opus 4.7、Opus 4.6、Sonnet 4.6 支持 1M 上下文**，其他默认 200K
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **客户端 Key 分发**（v0.4.0+）：在 Admin 面板生成多把 `csk_*` 客户端 Key 分发给下游用户/项目，每把 Key 独立启用/禁用与计数，泄露不影响其他用户
 - **用量统计与仪表盘**（v0.4.0+）：按请求记录 token 消耗（按日滚动 JSONL），仪表盘展示时间趋势、模型分布、上游凭据贡献
@@ -555,12 +555,22 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
-| `*haiku*` | `claude-haiku-4.5` |
+`map_model` 通过模型名中的关键词匹配（不区分大小写，支持 `4-7` 或 `4.7` 写法），转换为 Kiro 内部模型名：
+
+| Anthropic 模型（关键词） | Kiro 模型 | 上下文窗口 |
+|---|---|---|
+| `*sonnet*` 含 `4-6` / `4.6` | `claude-sonnet-4.6` | **1M** |
+| `*sonnet*`（其他，默认） | `claude-sonnet-4.5` | 200K |
+| `*opus*` 含 `4-7` / `4.7` | `claude-opus-4.7` | **1M** |
+| `*opus*` 含 `4-6` / `4.6` | `claude-opus-4.6` | **1M** |
+| `*opus*` 含 `4-5` / `4.5` | `claude-opus-4.5` | 200K |
+| `*haiku*` | `claude-haiku-4.5` | 200K |
+
+> **1M 上下文支持**：Kiro 于 2026-03-24 将 Sonnet 4.6 / Opus 4.6 升级到 1M 上下文窗口，Opus 4.7 同样为 1M。其余模型仍为 200K。本服务在收到这三类模型请求时会按 1M 计算 `contextUsageEvent` 的实际 `input_tokens`，前端发起 `max_tokens` 大请求时不需要额外配置。
+>
+> 模型名带 `-thinking` 后缀（如 `claude-opus-4-7-thinking`）会自动覆写 `thinking` 配置：Opus 4.6 走 `adaptive` 模式，其他走 `enabled` 模式，`budget_tokens` 固定 20000。Opus 4.6 同时强制 `output_config.effort = "high"`。
+
+可用模型完整列表通过 `GET /v1/models` 查询。
 
 ## Admin（可选）
 
