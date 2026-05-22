@@ -1,53 +1,85 @@
-# Rust build artifacts
-target/
-Cargo.lock
+# =============================================================================
+# .dockerignore — 缩小 docker 构建上下文，加快 COPY、避免泄露敏感数据
+#
+# 原则：
+# 1. 移除构建无关的开发产物（target/、node_modules/、IDE 文件等）
+# 2. 排除运行时持久化数据（凭据、Key、用量日志等），即使本地有也不进镜像
+# 3. 保留构建必需的锁文件（Cargo.lock / bun.lock）以保证可重现构建
+# =============================================================================
 
-# Node.js dependencies and build artifacts
+# Rust 构建产物（容器内会重新 build）
+target/
+
+# Node.js 构建产物与缓存（容器内会重新 install + build）
 admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/.vite/
 
-# Version control
+# 版本控制
 .git/
 .gitignore
+.gitattributes
 
-# IDE and editor files
+# IDE / 编辑器
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# Claude/AI
+# Claude / AI 工作区
 .claude/
+.ace-tool/
 CLAUDE.md
 AGENTS.md
 
-# CI/CD
+# CI / 工作流（构建用不到）
 .github/
 
-# Documentation and examples
+# 文档与示例（不影响构建产物）
 *.md
-README.md
 config.example.json
 credentials.example.*.json
 
-# Development and test files
+# 开发辅助
 src/test.rs
 src/debug.rs
 test.json
 tools/
 
-# OS-specific files
+# OS 特定文件
 .DS_Store
 Thumbs.db
 
-# Local configuration (keep templates only)
+# 本地运行时数据 — 都不应该进镜像
 config.json
 credentials.json
+credentials.*.json
+client_api_keys.json
+kiro_balance_cache.json
+kiro_stats.json
+proxy_pool.json
+usage_log.*.jsonl
+usage_stats.json
+data/
 
-# Docker files
+# 在线更新产物（GitHub Releases 二进制暂存 + 备份）
+*.staged-*
+*.backup
+
+# 环境变量与本地秘钥
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+logs/
+
+# Docker 自身配置（构建上下文里没必要再带一份）
 Dockerfile
+Dockerfile.*
 .dockerignore
 docker-compose*.yml
+docker-compose.*.yml
