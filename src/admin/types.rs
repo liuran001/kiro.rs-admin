@@ -1,5 +1,6 @@
 //! Admin API 类型定义
 
+use crate::admin::proxy_pool::ProxyHealth;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -356,6 +357,18 @@ pub struct ProxyPoolEntry {
     pub enabled: bool,
     /// 使用此代理的凭据数量
     pub credential_count: u32,
+    /// 健康状态
+    pub health: ProxyHealth,
+    /// 最近一次成功探测的延迟（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    /// 最近一次探测时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<String>,
+    /// 连续探测失败计数
+    pub consecutive_failures: u32,
+    /// 是否由健康检查自动禁用
+    pub auto_disabled: bool,
 }
 
 /// 代理池列表响应
@@ -364,6 +377,48 @@ pub struct ProxyPoolEntry {
 pub struct ProxyPoolResponse {
     pub total: usize,
     pub proxies: Vec<ProxyPoolEntry>,
+}
+
+/// 单个代理健康检查响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCheckResponse {
+    pub id: u64,
+    pub health: ProxyHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<String>,
+    pub enabled: bool,
+    pub auto_disabled: bool,
+}
+
+/// 全量健康检查响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyCheckAllResponse {
+    pub healthy: usize,
+    pub unhealthy: usize,
+    pub auto_disabled: usize,
+}
+
+/// 轮询批量分配请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignRoundRobinRequest {
+    /// 目标凭据 ID 列表；为空或缺省表示对全部凭据分配
+    #[serde(default)]
+    pub credential_ids: Option<Vec<u64>>,
+}
+
+/// 轮询批量分配响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignRoundRobinResponse {
+    /// 成功分配的凭据数
+    pub assigned: usize,
+    /// 参与轮询的可用代理数
+    pub proxy_count: usize,
 }
 
 /// 添加代理请求

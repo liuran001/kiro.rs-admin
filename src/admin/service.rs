@@ -19,13 +19,14 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
-    BalanceResponse, BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem,
-    CredentialsStatusResponse, EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse,
-    KamExportAccount, KamExportResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
-    PollIdcLoginResponse, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetUpdateConfigRequest, StartIdcLoginRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
+    AssignProxyRequest, AssignRoundRobinResponse, BalanceResponse, BatchAddProxyRequest,
+    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
+    GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount, KamExportResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
+    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -336,6 +337,7 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
+        let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
@@ -345,7 +347,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
-            proxy_pool: ProxyPoolManager::new(proxy_pool_path),
+            proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
             update_config: Mutex::new(update_config),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -696,6 +698,31 @@ impl AdminService {
                     "余额后台刷新完成：成功 {}，失败 {}，耗时 {:.1}s",
                     ok,
                     err,
+                    started.elapsed().as_secs_f32()
+                );
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// 启动代理池后台健康检查调度器
+    ///
+    /// - 启动后稍等片刻再执行首次探测
+    /// - 之后按 `interval` 周期循环，对所有已启用代理并发探测
+    /// - 连续探测失败达阈值的代理由 `check_all` 内部自动禁用
+    pub fn start_proxy_health_checker(self: &Arc<Self>, interval: std::time::Duration) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            // 启动后稍等片刻，让网络/代理就绪
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            loop {
+                let started = std::time::Instant::now();
+                let summary = svc.proxy_pool.check_all().await;
+                tracing::info!(
+                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
+                    summary.healthy,
+                    summary.unhealthy,
+                    summary.auto_disabled,
                     started.elapsed().as_secs_f32()
                 );
                 tokio::time::sleep(interval).await;
@@ -1841,6 +1868,11 @@ impl AdminService {
                     label: p.label,
                     enabled: p.enabled,
                     credential_count: count,
+                    health: p.health,
+                    latency_ms: p.latency_ms,
+                    last_checked_at: p.last_checked_at,
+                    consecutive_failures: p.consecutive_failures,
+                    auto_disabled: p.auto_disabled,
                 }
             })
             .collect();
@@ -1867,6 +1899,11 @@ impl AdminService {
             label: entry.label,
             enabled: entry.enabled,
             credential_count: 0,
+            health: entry.health,
+            latency_ms: entry.latency_ms,
+            last_checked_at: entry.last_checked_at,
+            consecutive_failures: entry.consecutive_failures,
+            auto_disabled: entry.auto_disabled,
         })
     }
 
@@ -1884,6 +1921,11 @@ impl AdminService {
                 label: e.label,
                 enabled: e.enabled,
                 credential_count: 0,
+                health: e.health,
+                latency_ms: e.latency_ms,
+                last_checked_at: e.last_checked_at,
+                consecutive_failures: e.consecutive_failures,
+                auto_disabled: e.auto_disabled,
             })
             .collect();
         (result, errors)
@@ -1949,6 +1991,77 @@ impl AdminService {
                     AdminServiceError::InternalError(msg)
                 }
             })
+    }
+
+    /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
+    pub async fn check_proxy(&self, id: u64) -> Result<ProxyCheckResponse, AdminServiceError> {
+        let entry = self
+            .proxy_pool
+            .check_one(id)
+            .await
+            .map_err(|_| AdminServiceError::NotFound { id })?;
+        Ok(ProxyCheckResponse {
+            id: entry.id,
+            health: entry.health,
+            latency_ms: entry.latency_ms,
+            last_checked_at: entry.last_checked_at,
+            enabled: entry.enabled,
+            auto_disabled: entry.auto_disabled,
+        })
+    }
+
+    /// 触发全部代理的健康检查
+    pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
+        let summary = self.proxy_pool.check_all().await;
+        ProxyCheckAllResponse {
+            healthy: summary.healthy,
+            unhealthy: summary.unhealthy,
+            auto_disabled: summary.auto_disabled,
+        }
+    }
+
+    /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
+    ///
+    /// - `credential_ids` 为 None 时对全部凭据分配
+    /// - 无可用代理时返回错误
+    pub fn assign_proxies_round_robin(
+        &self,
+        credential_ids: Option<Vec<u64>>,
+    ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
+        let urls = self.proxy_pool.assignable_urls();
+        if urls.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有可用代理（需已启用且健康检查未失败）".to_string(),
+            ));
+        }
+
+        let target_ids: Vec<u64> = match credential_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => self
+                .token_manager
+                .snapshot()
+                .entries
+                .iter()
+                .map(|c| c.id)
+                .collect(),
+        };
+
+        let mut assigned = 0;
+        for (i, cred_id) in target_ids.iter().enumerate() {
+            let url = urls[i % urls.len()].clone();
+            if self
+                .token_manager
+                .update_credential(*cred_id, None, Some(Some(url)), None, None)
+                .is_ok()
+            {
+                assigned += 1;
+            }
+        }
+
+        Ok(AssignRoundRobinResponse {
+            assigned,
+            proxy_count: urls.len(),
+        })
     }
 
     // ============ 错误分类 ============

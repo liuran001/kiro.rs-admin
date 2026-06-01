@@ -26,6 +26,58 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
+/// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
+const CLIENT_CACHE_CAP: usize = 64;
+
+/// 带容量上限的 HTTP Client 缓存。
+///
+/// - key 为 effective proxy 配置（None = 直连/全局回退）
+/// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
+/// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
+struct ClientCache {
+    map: HashMap<Option<ProxyConfig>, Client>,
+    /// 插入顺序（仅记录可淘汰的非受保护 key）
+    order: std::collections::VecDeque<Option<ProxyConfig>>,
+    /// 受保护、不参与淘汰的 key（全局代理）
+    protected: Option<ProxyConfig>,
+    cap: usize,
+}
+
+impl ClientCache {
+    fn new(protected: Option<ProxyConfig>, initial: Client, cap: usize) -> Self {
+        let mut map = HashMap::new();
+        map.insert(protected.clone(), initial);
+        Self {
+            map,
+            order: std::collections::VecDeque::new(),
+            protected,
+            cap,
+        }
+    }
+
+    fn get(&self, key: &Option<ProxyConfig>) -> Option<Client> {
+        self.map.get(key).cloned()
+    }
+
+    /// 插入新条目，必要时淘汰最旧的非受保护条目
+    fn insert(&mut self, key: Option<ProxyConfig>, client: Client) {
+        if key == self.protected || self.map.contains_key(&key) {
+            self.map.insert(key, client);
+            return;
+        }
+        while self.order.len() >= self.cap {
+            if let Some(evict) = self.order.pop_front() {
+                self.map.remove(&evict);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, client);
+    }
+}
+
 /// API 调用结果，附带本次实际命中的上游凭据 ID（用于用量统计）
 pub struct KiroCallResult {
     pub response: reqwest::Response,
@@ -42,8 +94,9 @@ pub struct KiroProvider {
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
+    /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
+    client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -72,16 +125,15 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client
+        // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
         let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
             .expect("创建 HTTP 客户端失败");
-        let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             global_proxy: proxy,
-            client_cache: Mutex::new(cache),
+            client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -93,7 +145,7 @@ impl KiroProvider {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
-            return Ok(client.clone());
+            return Ok(client);
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());

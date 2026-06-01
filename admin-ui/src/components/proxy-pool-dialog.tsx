@@ -1,6 +1,18 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { Trash2, Plus, Upload, ToggleLeft, ToggleRight, Globe } from 'lucide-react'
+import {
+  Trash2,
+  Plus,
+  Upload,
+  ToggleLeft,
+  ToggleRight,
+  Globe,
+  Activity,
+  Shuffle,
+  CheckCircle2,
+  XCircle,
+  HelpCircle,
+} from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -19,6 +31,9 @@ import {
   setProxyEnabled,
   getGlobalProxy,
   setGlobalProxy,
+  checkProxy,
+  checkAllProxies,
+  assignProxiesRoundRobin,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import type { ProxyPoolEntry } from '@/types/api'
@@ -108,10 +123,72 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
   })
 
+  const [checkingId, setCheckingId] = useState<number | null>(null)
+  const checkMutation = useMutation({
+    mutationFn: (id: number) => checkProxy(id),
+    onMutate: (id) => setCheckingId(id),
+    onSuccess: (res) => {
+      if (res.health === 'healthy') {
+        toast.success(`代理可用，延迟 ${res.latencyMs ?? '-'} ms`)
+      } else {
+        toast.error(res.autoDisabled ? '代理探测失败，已自动禁用' : '代理探测失败')
+      }
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+    },
+    onError: (err) => toast.error(`探测失败: ${extractErrorMessage(err)}`),
+    onSettled: () => setCheckingId(null),
+  })
+
+  const checkAllMutation = useMutation({
+    mutationFn: () => checkAllProxies(),
+    onSuccess: (res) => {
+      toast.success(
+        `健康检查完成：健康 ${res.healthy}，异常 ${res.unhealthy}，自动禁用 ${res.autoDisabled}`
+      )
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+    },
+    onError: (err) => toast.error(`检查失败: ${extractErrorMessage(err)}`),
+  })
+
+  const assignRoundRobinMutation = useMutation({
+    mutationFn: () => assignProxiesRoundRobin(null),
+    onSuccess: (res) => {
+      toast.success(`已用 ${res.proxyCount} 个代理轮询分配给 ${res.assigned} 个凭据`)
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (err) => toast.error(`分配失败: ${extractErrorMessage(err)}`),
+  })
+
   const handleAdd = (e: React.FormEvent) => {
     e.preventDefault()
     if (!newUrl.trim()) return
     addMutation.mutate()
+  }
+
+  const renderHealthBadge = (proxy: ProxyPoolEntry) => {
+    if (proxy.health === 'healthy') {
+      return (
+        <Badge variant="outline" className="text-xs gap-1 border-green-500/50 text-green-600 dark:text-green-400">
+          <CheckCircle2 className="h-3 w-3" />
+          {proxy.latencyMs != null ? `${proxy.latencyMs}ms` : '可用'}
+        </Badge>
+      )
+    }
+    if (proxy.health === 'unhealthy') {
+      return (
+        <Badge variant="outline" className="text-xs gap-1 border-destructive/50 text-destructive">
+          <XCircle className="h-3 w-3" />
+          异常{proxy.consecutiveFailures > 0 ? ` ×${proxy.consecutiveFailures}` : ''}
+        </Badge>
+      )
+    }
+    return (
+      <Badge variant="outline" className="text-xs gap-1 text-muted-foreground">
+        <HelpCircle className="h-3 w-3" />
+        未检测
+      </Badge>
+    )
   }
 
   return (
@@ -219,8 +296,36 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
 
           {/* 代理列表 */}
           <div className="space-y-1">
-            <div className="text-sm text-muted-foreground">
-              共 {data?.total ?? 0} 个代理
+            <div className="flex items-center justify-between">
+              <div className="text-sm text-muted-foreground">
+                共 {data?.total ?? 0} 个代理
+              </div>
+              {(data?.total ?? 0) > 0 && (
+                <div className="flex items-center gap-1">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => checkAllMutation.mutate()}
+                    disabled={checkAllMutation.isPending}
+                    title="对所有已启用代理执行健康检查"
+                  >
+                    <Activity className="h-3 w-3 mr-1" />
+                    {checkAllMutation.isPending ? '检测中...' : '全部检测'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => assignRoundRobinMutation.mutate()}
+                    disabled={assignRoundRobinMutation.isPending}
+                    title="将可用代理轮询分配给所有凭据"
+                  >
+                    <Shuffle className="h-3 w-3 mr-1" />
+                    轮询分配
+                  </Button>
+                </div>
+              )}
             </div>
 
             {isLoading && (
@@ -237,24 +342,45 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
               {data?.proxies.map((proxy: ProxyPoolEntry) => (
                 <div key={proxy.id} className="flex items-center gap-3 p-3">
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono text-xs truncate">
                         {maskProxyUrl(proxy.url)}
                       </span>
                       {proxy.label && (
                         <Badge variant="secondary" className="text-xs">{proxy.label}</Badge>
                       )}
+                      {renderHealthBadge(proxy)}
                       {!proxy.enabled && (
-                        <Badge variant="outline" className="text-xs text-muted-foreground">已禁用</Badge>
+                        <Badge variant="outline" className="text-xs text-muted-foreground">
+                          {proxy.autoDisabled ? '自动禁用' : '已禁用'}
+                        </Badge>
                       )}
                     </div>
-                    {proxy.credentialCount > 0 && (
-                      <div className="text-xs text-muted-foreground mt-0.5">
-                        {proxy.credentialCount} 个凭据使用中
-                      </div>
-                    )}
+                    <div className="flex items-center gap-3 mt-0.5">
+                      {proxy.credentialCount > 0 && (
+                        <span className="text-xs text-muted-foreground">
+                          {proxy.credentialCount} 个凭据使用中
+                        </span>
+                      )}
+                      {proxy.lastCheckedAt && (
+                        <span className="text-xs text-muted-foreground">
+                          检测于 {new Date(proxy.lastCheckedAt).toLocaleString()}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-xs"
+                      onClick={() => checkMutation.mutate(proxy.id)}
+                      disabled={checkingId === proxy.id}
+                      title="测试此代理连通性"
+                    >
+                      <Activity className="h-3 w-3 mr-1" />
+                      {checkingId === proxy.id ? '测试中' : '测试'}
+                    </Button>
                     {onSelectProxy && proxy.enabled && (
                       <Button
                         size="sm"
