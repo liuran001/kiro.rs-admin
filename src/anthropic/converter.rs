@@ -203,18 +203,111 @@ fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
             .is_some_and(|t| t.thinking_type == "adaptive")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffortTier {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl EffortTier {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String> {
+    let trimmed = raw_effort.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let requested = match EffortTier::parse(trimmed) {
+        Some(tier) => tier,
+        None => {
+            tracing::debug!(
+                model_id = %model_id,
+                effort = %trimmed,
+                fallback_effort = EffortTier::High.as_str(),
+                "falling back unsupported output_config.effort"
+            );
+            return Some(EffortTier::High.as_str().to_string());
+        }
+    };
+
+    // `xhigh` is a newer effort tier. Known older effort-capable models reject
+    // it with `Invalid additionalModelRequestFields`, so map to the nearest
+    // lower tier instead of failing the request. Unknown/future models keep
+    // recognized values intact to avoid maintaining a brittle full allow-list.
+    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+        EffortTier::High
+    } else {
+        requested
+    };
+    if normalized != requested || normalized.as_str() != trimmed {
+        tracing::debug!(
+            model_id = %model_id,
+            effort = %trimmed,
+            normalized_effort = normalized.as_str(),
+            "normalized output_config.effort for model"
+        );
+    }
+
+    Some(normalized.as_str().to_string())
+}
+
+fn model_supports_xhigh_effort(model_id: &str) -> bool {
+    let model = model_id.to_ascii_lowercase();
+
+    // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
+    if model.contains("opus-4.7")
+        || model.contains("opus-4.8")
+        || model.contains("fable-5")
+        || model.contains("mythos-5")
+        || model.contains("claude-5")
+    {
+        return true;
+    }
+
+    // Known Kiro/Claude model ids that predate xhigh. Keep this as a compact
+    // deny-list, not a full capability matrix.
+    !matches!(
+        model.as_str(),
+        "claude-opus-4.6"
+            | "claude-sonnet-4.6"
+            | "claude-opus-4.5"
+            | "claude-sonnet-4.5"
+            | "claude-haiku-4.5"
+    )
+}
+
 fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_id: &str,
 ) -> Option<AdditionalModelRequestFields> {
     let output_config = if should_emit_output_config(req, model_id) {
         req.output_config.as_ref().and_then(|oc| {
-            if oc.effort.trim().is_empty() {
-                return None;
-            }
-            Some(KiroOutputConfig {
-                effort: oc.effort.clone(),
-            })
+            normalize_effort_for_model(model_id, &oc.effort)
+                .map(|effort| KiroOutputConfig { effort })
         })
     } else {
         if let Some(oc) = &req.output_config
@@ -825,7 +918,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
 }
 
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -836,8 +929,8 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
             let effort = req
                 .output_config
                 .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
+                .and_then(|c| normalize_effort_for_model(model_id, &c.effort))
+                .unwrap_or_else(|| "high".to_string());
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -864,7 +957,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
+    let thinking_prefix = generate_thinking_prefix(req, model_id);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -1216,6 +1309,10 @@ mod tests {
     }
 
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
+        minimal_request_with_effort(model, "high")
+    }
+
+    fn minimal_request_with_effort(model: &str, effort: &str) -> MessagesRequest {
         use super::super::types::{Message as AnthropicMessage, OutputConfig};
 
         MessagesRequest {
@@ -1231,7 +1328,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: Some(OutputConfig {
-                effort: "high".to_string(),
+                effort: effort.to_string(),
             }),
             metadata: None,
         }
@@ -1241,6 +1338,17 @@ mod tests {
         use super::super::types::Thinking;
 
         let mut req = minimal_request_with_output_config(model);
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        req
+    }
+
+    fn minimal_adaptive_thinking_request_with_effort(model: &str, effort: &str) -> MessagesRequest {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_effort(model, effort);
         req.thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
@@ -1317,6 +1425,100 @@ mod tests {
             fields.output_config.unwrap().effort,
             "high",
             "effort should be passed through for the supported model"
+        );
+    }
+
+    #[test]
+    fn test_output_config_downgrades_xhigh_for_opus_4_6() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "xhigh");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.6 adaptive thinking should keep output_config");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "high",
+            "opus 4.6 upstream only accepts low/medium/high/max, so xhigh should downgrade"
+        );
+    }
+
+    #[test]
+    fn test_output_config_downgrades_xhigh_for_known_older_models() {
+        for model in [
+            "claude-opus-4.6",
+            "claude-sonnet-4.6",
+            "claude-opus-4.5",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+        ] {
+            assert_eq!(
+                normalize_effort_for_model(model, "xhigh").as_deref(),
+                Some("high"),
+                "{model} should not emit xhigh"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_config_preserves_xhigh_for_models_without_known_restriction() {
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.7", "xhigh").as_deref(),
+            Some("xhigh"),
+            "opus 4.7 supports xhigh"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.8", "xhigh").as_deref(),
+            Some("xhigh"),
+            "opus 4.8 supports xhigh"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-5", "xhigh").as_deref(),
+            Some("xhigh"),
+            "claude 5 supports xhigh"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-sonnet-5.1", "xhigh").as_deref(),
+            Some("xhigh"),
+            "future models should not require explicit allow-listing for recognized effort values"
+        );
+        assert_eq!(
+            normalize_effort_for_model("claude-unknown-9", "xhigh").as_deref(),
+            Some("xhigh"),
+            "unknown future models should keep recognized effort values"
+        );
+    }
+
+    #[test]
+    fn test_output_config_normalizes_effort_case_and_spacing() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "  MAX  ");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.6 adaptive thinking should keep output_config");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "max",
+            "effort should be normalized before being sent to upstream"
+        );
+    }
+
+    #[test]
+    fn test_output_config_unknown_effort_falls_back_to_high() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-4-6-thinking", "extreme");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.6 adaptive thinking should keep output_config");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "high",
+            "unknown effort values should fall back instead of causing upstream validation errors"
         );
     }
 

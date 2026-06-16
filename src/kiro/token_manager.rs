@@ -869,6 +869,9 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
+    /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
+    /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
+    next_id: AtomicU64,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
@@ -915,6 +918,22 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
         None => true,
         Some(g) => cred_groups.iter().any(|cg| cg == g),
     }
+}
+
+fn credential_matches_request(
+    credentials: &KiroCredentials,
+    model: Option<&str>,
+    group: Option<&str>,
+) -> bool {
+    let is_opus = model
+        .map(|m| m.to_ascii_lowercase().contains("opus"))
+        .unwrap_or(false);
+
+    if is_opus && !credentials.supports_opus() {
+        return false;
+    }
+
+    group_matches(&credentials.groups, group)
 }
 
 impl MultiTokenManager {
@@ -1026,6 +1045,7 @@ impl MultiTokenManager {
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
+            next_id: AtomicU64::new(next_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format: AtomicBool::new(is_multiple_format),
@@ -1119,11 +1139,6 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let now = Instant::now();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
@@ -1135,12 +1150,8 @@ impl MultiTokenManager {
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                // 账号分组隔离：Key 绑定分组时只用该分组内的账号
-                if !group_matches(&e.credentials.groups, group) {
+                // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
+                if !credential_matches_request(&e.credentials, model, group) {
                     return false;
                 }
                 true
@@ -1213,7 +1224,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && group_matches(&e.credentials.groups, group)
+                                && credential_matches_request(&e.credentials, model, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -2700,11 +2711,10 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
-        };
+        // 4. 分配新 ID。必须使用单调计数器，不能按当前 entries 最大值重算；
+        // 否则删除最后一个账号后再添加会复用旧 ID，导致 trace/usage/kiro_stats
+        // 这类按 credential_id 聚合的历史被新账号继承。
+        let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
@@ -4019,6 +4029,43 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_does_not_reuse_deleted_id() {
+        let path = tmp_creds_path("add_cred_no_reuse_deleted_id");
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.kiro_api_key = Some("ksk_existing_1".to_string());
+        cred1.auth_method = Some("api_key".to_string());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.kiro_api_key = Some("ksk_existing_2".to_string());
+        cred2.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.delete_credential(2).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk_new_3".to_string());
+        new_cred.auth_method = Some("api_key".to_string());
+
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+        assert_eq!(
+            new_id, 3,
+            "new credential IDs must not reuse deleted IDs, otherwise historical failure logs attach to the new account"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── try_reload_credential_from_file ─────────────────────────────────────
 
     /// 文件中有新 refreshToken 时，reload 返回 true 并更新内存凭据
@@ -4189,6 +4236,33 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_priority_current_respects_model_support() {
+        let mut free_cred = grouped_cred("free", &[]);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut pro_cred = grouped_cred("pro", &[]);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+        pro_cred.priority = 10;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
+                .unwrap();
+
+        // Warm current_id with the highest-priority Free account.
+        let current = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(current.id, 1);
+
+        let opus = manager
+            .acquire_context(Some("claude-opus-4.6"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            opus.id, 2,
+            "priority current_id must not bypass Opus subscription filtering"
+        );
     }
 
     #[test]

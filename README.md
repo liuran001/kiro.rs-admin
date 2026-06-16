@@ -495,7 +495,7 @@ Adaptive thinking：
 }
 ```
 
-`additionalModelRequestFields.output_config` 是 Kiro 上游的窄兼容字段。当前只会在已知可接受该字段的 Opus 4.6 adaptive thinking 路径上传递；Sonnet 4.5 / 4.8、Opus 4.6 非 adaptive thinking 等路径会跳过该字段，避免上游返回 `additionalModelRequestFields is not supported for this model`。
+`additionalModelRequestFields.output_config` 是 Kiro 上游的窄兼容字段。当前只会在已知可接受该字段的 Opus 4.6 adaptive thinking 路径上传递；Sonnet 4.5 / 4.8、Opus 4.6 非 adaptive thinking 等路径会跳过该字段，避免上游返回 `additionalModelRequestFields is not supported for this model`。`effort` 会先归一化大小写和空格；已知 4.5 / 4.6 系列不接受 `xhigh`，会降级为最接近的 `high`；Opus 4.7 / 4.8、Fable 5、Mythos 5 会保留 `xhigh`；其它未知模型的已知 effort 值也会保持原样，避免维护一张容易过期的模型白名单；未知 effort 值会回退到 `high`。
 
 Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转换为 Anthropic 兼容内容：
 

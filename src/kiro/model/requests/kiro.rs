@@ -43,7 +43,9 @@ pub struct KiroRequest {
     ///     "output_config": { "effort": "max" }
     /// }
     /// ```
-    /// Five tiers: `low / medium / high / xhigh / max`
+    /// Effort tiers are model-dependent. Older 4.5/4.6 models accept
+    /// `low / medium / high / max`; newer effort-capable models may also
+    /// accept `xhigh`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
@@ -62,7 +64,9 @@ pub struct AdditionalModelRequestFields {
 
 /// The effort control field recognized by the AWS Q backend
 ///
-/// Accepts five tiers: `low / medium / high / xhigh / max`
+/// Accepted tiers are model-dependent. Older 4.5/4.6 models accept
+/// `low / medium / high / max`; newer effort-capable models may also accept
+/// `xhigh`.
 ///
 /// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
 /// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,

@@ -566,6 +566,44 @@ impl TraceStore {
         }
     }
 
+    /// 删除指定凭据关联的 trace 记录，避免删除账号后新账号复用同一 credential_id
+    /// 时继承旧账号的失败统计。
+    pub fn delete_for_credential(&self, credential_id: u64) {
+        if credential_id == 0 {
+            return;
+        }
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trace 凭据清理事务失败: {}", e);
+                return;
+            }
+        };
+        let res = (|| -> rusqlite::Result<usize> {
+            tx.execute(
+                "DELETE FROM trace_attempts WHERE credential_id = ?1 \
+                 OR trace_id IN (SELECT trace_id FROM traces WHERE final_credential_id = ?1)",
+                [credential_id],
+            )?;
+            let n = tx.execute(
+                "DELETE FROM traces WHERE final_credential_id = ?1",
+                [credential_id],
+            )?;
+            Ok(n)
+        })();
+        match res {
+            Ok(n) => {
+                if let Err(e) = tx.commit() {
+                    tracing::warn!("trace 凭据清理提交失败: {}", e);
+                } else if n > 0 {
+                    tracing::info!("已清理凭据 #{} 的 {} 条 trace 记录", credential_id, n);
+                }
+            }
+            Err(e) => tracing::warn!("trace 凭据清理失败: {}", e),
+        }
+    }
+
     /// 按凭据聚合失败跳数，归并为三类：鉴权 / 账号风控 / 其他。
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。
@@ -797,6 +835,40 @@ mod tests {
                 })
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn delete_for_credential_removes_failure_stats() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "old",
+            status: "error",
+            credential_id: 5,
+            model: "m1",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "keep",
+            status: "error",
+            credential_id: 6,
+            model: "m1",
+        }));
+
+        assert!(store.failure_stats().contains_key(&5));
+        store.delete_for_credential(5);
+
+        let stats = store.failure_stats();
+        assert!(!stats.contains_key(&5));
+        assert!(stats.contains_key(&6));
+        assert!(
+            store
+                .query(&TraceQuery {
+                    credential_id: Some(5),
+                    limit: 50,
+                    ..Default::default()
+                })
+                .is_empty(),
+            "deleted credential traces should not attach to a future account with the same id"
         );
     }
 

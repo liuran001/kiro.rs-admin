@@ -1018,6 +1018,10 @@ impl AdminService {
         }
         self.save_balance_cache();
 
+        if let Some(trace_store) = &self.trace_store {
+            trace_store.delete_for_credential(id);
+        }
+
         Ok(())
     }
 
