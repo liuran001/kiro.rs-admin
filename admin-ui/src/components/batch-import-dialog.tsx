@@ -11,6 +11,8 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
+import { GroupMultiSelect } from '@/components/group-select'
 import {
   batchImportCredentials,
   getProxyPool,
@@ -33,6 +35,7 @@ interface CredentialInput {
   authRegion?: string
   apiRegion?: string
   priority?: number
+  rpmLimit?: number
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
@@ -45,6 +48,7 @@ interface CredentialInput {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  groups?: string[]
 }
 
 interface VerificationResult {
@@ -83,6 +87,24 @@ function normalizeImportEntry(raw: unknown): CredentialInput {
   return merged as CredentialInput
 }
 
+/**
+ * 合并「导入对话框选择的分组」与「JSON 条目自带的 groups」，去重并去空白。
+ * 返回 undefined 表示不带 groups 字段（两边都为空时）。
+ */
+function mergeGroups(
+  selected: string[],
+  fromJson: string[] | undefined,
+): string[] | undefined {
+  const all = [
+    ...selected,
+    ...(Array.isArray(fromJson) ? fromJson : []),
+  ]
+    .map((g) => (typeof g === 'string' ? g.trim() : ''))
+    .filter(Boolean)
+  if (all.length === 0) return undefined
+  return Array.from(new Set(all))
+}
+
 
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
@@ -91,6 +113,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  // 导入时统一为所有账号设置的分组（与 JSON 内 groups 取并集）。
+  const [groups, setGroups] = useState<string[]>([])
+  const groupOptions = useGroupOptions()
   // 进行中的 AbortController，用于"停止导入"：abort 会让 fetch 流中断，
   // 服务端在下次写回事件时检测到接收端关闭即停止处理剩余凭据。
   const abortRef = useRef<AbortController | null>(null)
@@ -108,6 +133,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setGroups([])
   }
 
   // 按原始下标局部更新单行结果（避免每条全量拷贝之外的额外复杂度）
@@ -202,6 +228,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authMethod: 'api_key',
               kiroApiKey: apiKey,
               priority: cred.priority || 0,
+              // 导入默认不限速（0）；JSON 显式带 rpmLimit 时尊重原值
+              rpmLimit: cred.rpmLimit ?? 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -210,6 +238,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              groups: mergeGroups(groups, cred.groups),
             },
           })
         } else {
@@ -302,12 +331,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               issuerUrl: isExternalIdp ? issuerUrl : undefined,
               scopes: isExternalIdp ? scopes : undefined,
               priority: cred.priority || 0,
+              // 导入默认不限速（0）；JSON 显式带 rpmLimit 时尊重原值
+              rpmLimit: cred.rpmLimit ?? 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              groups: mergeGroups(groups, cred.groups),
             },
           })
         }
@@ -484,6 +516,21 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             />
             <p className="text-xs text-muted-foreground">
               💡 "开始导入并验活"会校验余额、失败自动排除；"直接导入"只落库不验活（更快）。两种模式均支持中途"停止"。
+            </p>
+          </div>
+
+          {/* 导入分组：选中的分组会统一应用到本次导入的所有账号
+              （与 JSON 内自带的 groups 取并集），免去导入后逐个改分组。 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">分组（可选）</label>
+            <GroupMultiSelect
+              value={groups}
+              options={groupOptions}
+              onChange={setGroups}
+              disabled={importing}
+            />
+            <p className="text-xs text-muted-foreground">
+              为本次导入的所有账号统一指定分组。RPM 上限默认不限速（0），可在导入后单独调整。
             </p>
           </div>
 

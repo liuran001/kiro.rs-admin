@@ -11,6 +11,8 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
+import { GroupMultiSelect } from '@/components/group-select'
 import {
   batchImportCredentials,
   getProxyPool,
@@ -190,6 +192,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  // 导入时统一为所有账号设置的分组。
+  const [groups, setGroups] = useState<string[]>([])
+  const groupOptions = useGroupOptions()
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 进行中的 AbortController，用于"停止导入"：abort 让 fetch 流中断，
   // 服务端在下次写回事件时检测到接收端关闭即停止处理剩余账号。
@@ -208,6 +213,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setGroups([])
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -382,6 +388,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,
+            // 导入默认不限速（0）
+            rpmLimit: 0,
+            groups: groups.length > 0 ? groups : undefined,
           },
         })
       }
@@ -584,6 +593,21 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
+          </div>
+
+          {/* 导入分组：选中的分组会统一应用到本次导入的所有账号，
+              免去导入后逐个改分组。 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">分组（可选）</label>
+            <GroupMultiSelect
+              value={groups}
+              options={groupOptions}
+              onChange={setGroups}
+              disabled={importing}
+            />
+            <p className="text-xs text-muted-foreground">
+              为本次导入的所有账号统一指定分组。RPM 上限默认不限速（0），可在导入后单独调整。
+            </p>
           </div>
 
           {/* 解析预览 */}
