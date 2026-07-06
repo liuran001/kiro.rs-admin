@@ -40,17 +40,6 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// OAuth 回调公网地址（远程部署时配置）。
-    ///
-    /// 留空：Social 登录在服务端本机启动临时回调端口（`http://127.0.0.1:{port}`），
-    /// 仅本机浏览器可达。
-    /// 配置后（如 `https://example.com/api/admin/auth/callback`）：OAuth `redirect_uri`
-    /// 改用此地址，浏览器授权后落到 `{callbackBaseUrl}/oauth/callback`，
-    /// 由本服务的公网回调路由接收 `code` 并自动完成登录，适配 Docker / VPS / Render 等远程部署。
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub callback_base_url: Option<String>,
-
     #[serde(default = "default_region")]
     pub region: String,
 
@@ -272,7 +261,6 @@ impl Default for Config {
         Self {
             host: default_host(),
             port: default_port(),
-            callback_base_url: None,
             region: default_region(),
             auth_region: None,
             api_region: None,

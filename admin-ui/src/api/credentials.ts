@@ -46,17 +46,6 @@ const api = axios.create({
   },
 })
 
-/**
- * 按当前浏览器访问地址自动派生 OAuth 回调公网地址。
- *
- * 面板与 API 同源（API 用相对 /api/admin 前缀），故浏览器自身知道的 origin 就是最可信的公网地址。
- * 浏览器授权后会落到 `${origin}/api/admin/auth/callback/oauth/callback`，由服务端公网回调路由接收。
- * 远程部署（Render / VPS / Docker）零配置即可用；若需强制覆盖，在后端 config.json 配 callbackBaseUrl。
- */
-function deriveCallbackBaseUrl(): string {
-  return `${window.location.origin}/api/admin/auth/callback`
-}
-
 // 请求拦截器添加 API Key
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -548,10 +537,7 @@ export async function updateAdminKey(req: UpdateAdminKeyRequest): Promise<Succes
 export async function startSocialLogin(
   req: StartSocialLoginRequest
 ): Promise<StartSocialLoginResponse> {
-  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', {
-    callbackBaseUrl: deriveCallbackBaseUrl(),
-    ...req,
-  })
+  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', req)
   return data
 }
 
@@ -579,10 +565,7 @@ export async function startSocialRelogin(
 ): Promise<StartSocialLoginResponse> {
   const { data } = await api.post<StartSocialLoginResponse>(
     `/credentials/${credentialId}/relogin/social/start`,
-    {
-      callbackBaseUrl: deriveCallbackBaseUrl(),
-      ...req,
-    }
+    req
   )
   return data
 }

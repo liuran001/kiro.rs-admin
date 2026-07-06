@@ -851,10 +851,6 @@ pub struct StartSocialLoginRequest {
     /// Kiro auth endpoint（留空用默认）
     #[serde(default)]
     pub auth_endpoint: Option<String>,
-    /// OAuth 回调公网地址（远程模式）。通常由前端按当前访问地址自动派生：
-    /// `${location.origin}/api/admin/auth/callback`。若 `config.callbackBaseUrl` 已配置则以其为准（覆盖）。
-    #[serde(default)]
-    pub callback_base_url: Option<String>,
 }
 
 /// 发起 Social 登录响应
@@ -867,9 +863,6 @@ pub struct StartSocialLoginResponse {
     pub portal_url: String,
     /// 会话过期时间（RFC3339）
     pub expires_at: String,
-    /// 是否处于远程回调模式（已配置 callbackBaseUrl）。
-    /// true 时 OAuth 回调指向公网路由，前端可自动轮询完成；false 时走本地端口。
-    pub remote: bool,
 }
 
 /// 手动完成 Social 登录请求（远程访问场景：从浏览器地址栏复制回调 URL）

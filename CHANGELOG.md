@@ -4,6 +4,49 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.9] - 2026-07-06
+
+主题：**Tool Call 全链路加固、tool inputSchema 规范化、CCH 缓存计量与 Thinking effort 修复、凭据持久化原子落盘，并回退 v0.6.7 的远程部署 Social 登录**。本版汇总 0.6.8 以来累积的多项 Rust 侧健壮性加固与一处回退：工具调用改为按 `tool_use_id` 缓冲后整体解析并显式暴露非法 JSON、Claude Code 内置工具名双向映射与 `<tool_use>` XML 泄漏过滤；规范化 MCP 工具 schema 以规避 Bedrock `TOOL_SCHEMA_INVALID` 400；修正主 Key 缓存计量口径并放宽原生 Thinking effort 下发范围；凭据回写改为 tmp+rename 原子落盘并锁定整个「快照 + 写盘」临界区（issue #23）；同时因 Kiro 收紧 OAuth 回调白名单，回退 v0.6.7 的远程部署 Social 登录（`redirect_uri` 恢复为本机 `127.0.0.1`，远程访问保留手动粘贴兜底）。多数改动参考 `Kiro-RS-Tool` 定位并移植 / 优化。
+
+### ✨ 增强 — Tool Call 全链路加固
+
+> 参考 [GreyGunG/Kiro-RS-Tool](https://github.com/GreyGunG/Kiro-RS-Tool) 定位并移植 / 优化其 `ToolJsonAccumulator`、统一工具调用管道等基础设施。
+
+- **分片缓冲后整体解析**：新增 `ToolJsonAccumulator`，按 `tool_use_id` 缓冲工具入参分片，`stop` 时整体解析；半截 / 非法 JSON 显式暴露（非流式 / CCH 回 502，实时流补发 `error` 事件），不再把半截 JSON 当完整工具调用转发；非流式移除静默回退 `{}` 与截断静默丢弃。
+- **Claude Code 内置工具双向兼容**：`toolCompatibilityMode`（默认 `claude-code`，`raw` 供排障）下对内置工具名与入参双向映射（`Write`↔`fs_write` 等）、替换内置 schema、隐藏 `fs_append`；入站还原以 Kiro 工具名匹配实现自动门控，`raw` 模式不误伤客户端同名工具。
+- **统一工具调用管道**：收敛到 `CompletedToolUse`（`from_kiro` 唯一还原、`emit_completed_tool_use` 唯一流式发出、`to_anthropic_block` 唯一非流式块），删除重复的 `synthesize_tool_use`。
+- **过滤 `<tool_use>` XML 泄漏**：`strip_tool_use_xml_leaks` + 跨 chunk `ToolUseXmlLeakFilter`（修复闭合标签跨 chunk 的场景）。
+
+### 🔧 修复 — tool inputSchema 规范化（规避 Bedrock `TOOL_SCHEMA_INVALID` 400）
+
+> 参考 [GreyGunG/Kiro-RS-Tool PR #6](https://github.com/GreyGunG/Kiro-RS-Tool/pull/6)。部分 MCP 工具（尤其 Claude Code workflow 并行子代理携带的）会因 schema 触发 Bedrock 400。
+
+- **顶层 `type` 强制 `object`**：`normalize_json_schema` 原先仅在 `type` 缺失 / 为空时补 `object`，`type:"array"` 等会漏过；现一律强制为 `object`（非 object 时告警并修正）。
+- **剥离顶层组合关键字**：新增 `strip_top_level_combinators`，剥离顶层 `oneOf` / `anyOf` / `allOf`（Bedrock / Anthropic 不支持顶层组合关键字）；原 schema 无 `properties` 时，从首个 `type:object` 的 variant 恢复 `properties` / `required` / `additionalProperties` / `description`，避免退化成空对象。
+- **命中即终止**：`CLIENT_VALIDATION_REASONS` 新增 `TOOL_SCHEMA_INVALID`——根因在请求体，重试 / 换号无用，命中即立即终止。
+
+### 🔧 修复 — CCH 缓存计量
+
+- **主 Key 不再模拟跨用户缓存**：`isolation_seed` 改为 `Option`，主 Key（`id=0`）无 session 时不再模拟跨用户缓存。
+- **分母口径修正**：被跳过的动态 system 前缀计入 `prompt_total` 分母。
+
+### 🔧 修复 — Thinking effort 下发范围
+
+- **放宽原生 effort**：原生 `effort` 下发扩展至 Opus 4.6 / 4.7 / 4.8 + Sonnet 4.6 + 5 系。
+- **从预算推导**：支持从 `thinking.budget_tokens` 推导 `effort`。
+
+### 🔐 修复 — 凭据持久化原子落盘（issue #23）
+
+- **锁定整个临界区**：`persist_lock` 覆盖「快照 + 序列化 + 写盘」整个临界区，最后写盘者必在临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token；`entries.lock` 仅在快照期短暂持有、不跨磁盘 I/O，故不阻塞请求路由。
+- **tmp+rename 原子落盘**：先写临时文件再同目录 `rename`（原子操作），失败时清理临时文件，避免崩溃 / 并发导致半截凭据文件。
+
+### ⏪ 回退 — 远程部署 Social 登录（撤销 Issue #20）
+
+- **移除公网回调路由**：删除免鉴权 `GET /api/admin/auth/callback/{*tail}` 及其回调投递逻辑（`social_oauth_callback` / `deliver_remote_social_callback` / `RemoteCallbackOutcome`）。
+- **移除回调地址派生**：删除 `config.callbackBaseUrl` 配置项与前端 `deriveCallbackBaseUrl`（按 `location.origin` 自动派生），`start_social_login` / `start_social_relogin` 恢复为始终启动本机临时 TCP 回调端口，`redirect_uri` 固定为 `http://127.0.0.1:{port}`。
+- **移除 `remote` 响应字段**：`StartSocialLoginResponse` 不再返回 `remote`；前端登录 / 重新登录对话框回到「本地访问自动轮询、远程访问手动粘贴」两态。
+- **保留手动完成兜底**：`POST /auth/social/complete/{sessionId}`（及重新登录版本）保留不变——远程访问用户仍可从浏览器地址栏复制 localhost 失败页的完整 URL 粘贴完成登录。
+
 ## [0.6.8] - 2026-07-06
 
 主题：**新增 Claude Sonnet 5 / Claude Fable 5 模型映射 + 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证**。这一版把请求模型关键词映射扩展到 5 代 Sonnet / Fable，并让 `/v1/models` 能列出它们；同时新增第四种认证方式 `external_idp`，支持以 JSON 导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入），Token 走 IdP 的 OAuth2 `refresh_token` grant 刷新，并在导入与刷新两处对 IdP 端点做 allow-list 校验，防止 refresh token 外泄。

@@ -146,10 +146,9 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       } else {
         window.open(resp.portalUrl, '_blank')
       }
-      // 始终轮询：本地模式由本地回调服务器投递；服务端远程模式（resp.remote）
-      // 由公网 GET 回调路由投递 channel，轮询都能自动完成。
-      // 仅浏览器远程访问且未配置 callbackBaseUrl 时靠下方手动粘贴兜底（轮询无害）。
-      schedulePoll(resp.sessionId)
+      // 本地访问：本地回调服务器投递，自动轮询完成。
+      // 远程访问：OAuth 回调落到 localhost 失败页，靠下方手动粘贴回调 URL 完成。
+      if (!isRemote) schedulePoll(resp.sessionId)
     } catch (e) {
       loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
@@ -307,9 +306,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               </div>
             )}
 
-            {isRemote && !session.remote ? (
-              // 浏览器远程访问且服务端未配置 callbackBaseUrl：OAuth 回调到 localhost 无法被捕获，
-              // 需用户从地址栏复制完整 URL 手动粘贴完成。
+            {isRemote ? (
+              // 远程访问：OAuth 回调到 localhost 无法被捕获，需用户从地址栏复制完整 URL 手动粘贴完成。
               <div className="space-y-2">
                 <p className="text-sm text-amber-600 dark:text-amber-400">
                   完成登录后，浏览器会跳转到 <code>localhost</code> 失败页面，
@@ -326,9 +324,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
             ) : (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                {session.remote
-                  ? '完成登录后浏览器会自动跳回本服务，正在等待自动完成…'
-                  : '正在等待登录完成…'}
+                正在等待登录完成…
               </div>
             )}
           </div>
@@ -354,7 +350,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={isCompleting}>
                 取消
               </Button>
-              {isRemote && session && !session.remote && (
+              {isRemote && (
                 <Button
                   onClick={handleCompleteManually}
                   disabled={isCompleting || !callbackUrl.trim()}

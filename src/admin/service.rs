@@ -181,26 +181,10 @@ struct SocialAuthSession {
     callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
-    /// Drop 时自动关闭回调服务器并释放端口（本地模式 Some；远程模式 None）
-    _server_handle: Option<social::ServerHandle>,
-    /// 远程模式：公网 GET 回调路由通过此 Sender 投递回调数据（本地模式 None）。
-    /// 取出后即 None，保证只投递一次。
-    remote_callback_tx:
-        Option<Mutex<Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>>>,
+    /// Drop 时自动关闭回调服务器并释放端口
+    _server_handle: social::ServerHandle,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
-}
-
-/// 远程公网回调投递结果（供 GET 回调路由渲染提示页）
-pub enum RemoteCallbackOutcome {
-    /// 已成功投递，等待轮询完成 token 兑换
-    Delivered,
-    /// 会话不存在（state 不匹配 / 非远程模式会话）
-    NotFound,
-    /// 会话已过期
-    Expired,
-    /// 回调已被处理过（重复点击 / 并发完成）
-    AlreadyCompleted,
 }
 
 /// IdC 设备授权会话状态
@@ -2501,9 +2485,8 @@ impl AdminService {
 
     /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
     ///
-    /// 回调模式由 `config.callbackBaseUrl` 决定：
-    /// - 已配置 → 远程模式：redirect_uri 使用公网地址，由本服务的 `/auth/callback` GET 路由接收回调
-    /// - 未配置 → 本地模式：启动临时 TCP 回调服务器（浏览器与服务端须同机）
+    /// 始终在服务端本机启动临时 TCP 回调服务器，redirect_uri 为 `http://127.0.0.1:{port}`。
+    /// 本机浏览器授权后自动完成；远程访问时用户从地址栏复制回调 URL，经 `complete_social_login` 手动完成。
     pub async fn start_social_login(
         &self,
         req: StartSocialLoginRequest,
@@ -2522,32 +2505,14 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        // 回调模式：配置了 callbackBaseUrl → 远程模式（公网回调路由自动接收）；
-        // 否则本地模式（启动临时 TCP 端口，仅本机浏览器可达）。
-        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
-            Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                // 远程模式：暂存 Sender，由公网 GET 回调路由投递回调数据
-                (
-                    base,
-                    None,
-                    Some(Mutex::new(Some(tx))),
-                    rx,
-                )
-            }
-            None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                (
-                    format!("http://127.0.0.1:{}", port),
-                    Some(server_handle),
-                    None,
-                    rx,
-                )
-            }
-        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        // 启动本地 TCP 回调服务器（本地模式）
+        // 远程访问时用户须从浏览器地址栏复制回调 URL，通过 complete_social_login 接口手动完成
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -2571,7 +2536,6 @@ impl AdminService {
             cred_template,
             proxy,
             _server_handle: server_handle,
-            remote_callback_tx,
             relogin_target_id: None,
         };
 
@@ -2583,7 +2547,6 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
-            remote: remote_base.is_some(),
         })
     }
 
@@ -2767,74 +2730,6 @@ impl AdminService {
             state,
         };
         self.do_complete_social_login(session_id, callback).await
-    }
-
-    /// 解析远程回调 base，优先级：`config.callbackBaseUrl`（显式覆盖 / 逃生口）> 请求自带 base > None（本地模式）。
-    ///
-    /// 返回 None 表示回落本地模式（都未提供 / 提供的值非法时记 warn）。
-    fn resolve_callback_base(&self, req_base: Option<&str>) -> Option<String> {
-        // 优先用 config 显式配置；否则用前端按当前访问地址派生的请求值
-        let raw = self
-            .token_manager
-            .config()
-            .callback_base_url
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| req_base.map(str::to_string))?;
-        let trimmed = raw.trim().trim_end_matches('/');
-        if trimmed.is_empty() {
-            return None;
-        }
-        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-            tracing::warn!(
-                "callbackBaseUrl 非法（须以 http:// 或 https:// 开头），回落本地回调模式: {}",
-                raw
-            );
-            return None;
-        }
-        Some(trimmed.to_string())
-    }
-
-    /// 公网 GET 回调路由调用：按 OAuth state 定位会话并投递回调数据。
-    ///
-    /// 命中且未过期 → 投递进会话 oneshot channel（由 poll_social_login 统一完成 token 兑换）；
-    /// 不存在 / 已过期 / 非远程会话 → 返回相应结果，由调用方渲染提示页。
-    pub fn deliver_remote_social_callback(
-        &self,
-        state: &str,
-        data: social::OAuthCallbackData,
-    ) -> RemoteCallbackOutcome {
-        let sessions = self.social_sessions.lock();
-        // 找到 state 匹配的会话（state 每会话随机，提供 CSRF 保护）
-        let session_id = sessions
-            .iter()
-            .find_map(|(id, s)| (s.state == state).then_some(id.clone()));
-
-        let Some(session_id) = session_id else {
-            return RemoteCallbackOutcome::NotFound;
-        };
-        let session = sessions.get(&session_id).expect("刚查到的会话必然存在");
-        if Utc::now() >= session.expires_at {
-            return RemoteCallbackOutcome::Expired;
-        }
-        let tx_slot = match session.remote_callback_tx.as_ref() {
-            Some(slot) => slot,
-            None => return RemoteCallbackOutcome::NotFound, // 本地模式会话：不应由公网路由投递
-        };
-        // 释放外层锁后再投递（send 不阻塞，但避免持锁发送）
-        let tx = tx_slot.lock().take();
-        drop(sessions);
-        match tx {
-            Some(tx) => {
-                if tx.send(data).is_ok() {
-                    RemoteCallbackOutcome::Delivered
-                } else {
-                    // 接收端已消失（会话被并发完成/移除）→ 视为已处理
-                    RemoteCallbackOutcome::AlreadyCompleted
-                }
-            }
-            None => RemoteCallbackOutcome::AlreadyCompleted,
-        }
     }
 
     /// 分类删除凭据错误
@@ -3069,25 +2964,12 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        // 回调模式同 start_social_login：远程模式走公网回调路由，本地模式走临时端口
-        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
-        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
-            Some(base) => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                (base, None, Some(Mutex::new(Some(tx))), rx)
-            }
-            None => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-                let (port, server_handle) = social::start_callback_server(tx)
-                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-                (
-                    format!("http://127.0.0.1:{}", port),
-                    Some(server_handle),
-                    None,
-                    rx,
-                )
-            }
-        };
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        let (port, server_handle) = social::start_callback_server(tx)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let redirect_uri = format!("http://127.0.0.1:{}", port);
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -3103,7 +2985,6 @@ impl AdminService {
             cred_template: KiroCredentials::default(),
             proxy,
             _server_handle: server_handle,
-            remote_callback_tx,
             relogin_target_id: Some(target_id),
         };
 
@@ -3115,7 +2996,6 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
-            remote: remote_base.is_some(),
         })
     }
 

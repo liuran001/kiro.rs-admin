@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
@@ -631,90 +631,6 @@ pub async fn complete_social_login(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
-}
-
-/// GET /api/admin/auth/callback/{*tail}
-///
-/// 远程部署模式下的 OAuth 公网回调入口（免鉴权，浏览器顶层导航到达）。
-/// Kiro portal 在 redirect_uri 末尾追加 `/oauth/callback` 或 `/signin/callback`，
-/// 故完整路径形如 `/api/admin/auth/callback/oauth/callback?code=...&state=...`。
-///
-/// 安全：依赖 OAuth `state`（每会话随机 UUID）定位会话，提供 CSRF 保护，与本地回调服务器同等信任级别。
-/// 本路由只把回调数据投递进会话 channel，真正的 token 兑换由 `poll_social_login` 统一完成。
-pub async fn social_oauth_callback(
-    State(state): State<AdminState>,
-    Path(tail): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Html<String> {
-    use crate::kiro::auth::social::OAuthCallbackData;
-    use super::service::RemoteCallbackOutcome;
-
-    // OAuth 错误回调（如用户拒绝授权）
-    if params.contains_key("error") {
-        let msg = params
-            .get("error_description")
-            .or_else(|| params.get("error"))
-            .cloned()
-            .unwrap_or_else(|| "未知错误".to_string());
-        return Html(render_callback_page(false, &format!("授权失败：{}", msg)));
-    }
-
-    let Some(code) = params.get("code").cloned() else {
-        return Html(render_callback_page(false, "回调缺少 code 参数"));
-    };
-    let oauth_state = params.get("state").cloned().unwrap_or_default();
-    let login_option = params.get("login_option").cloned().unwrap_or_default();
-    // portal 追加的路径（oauth/callback 或 signin/callback），用于还原 token 兑换用的 redirect_uri
-    let path = {
-        let trimmed = tail.trim_start_matches('/');
-        if trimmed.is_empty() {
-            "/oauth/callback".to_string()
-        } else {
-            format!("/{}", trimmed)
-        }
-    };
-
-    let data = OAuthCallbackData {
-        code,
-        login_option,
-        path,
-        state: oauth_state.clone(),
-    };
-
-    match state.service.deliver_remote_social_callback(&oauth_state, data) {
-        RemoteCallbackOutcome::Delivered => {
-            Html(render_callback_page(true, "登录回调已收到，请返回 Kiro Admin 标签页查看结果"))
-        }
-        RemoteCallbackOutcome::AlreadyCompleted => {
-            Html(render_callback_page(true, "该登录回调已处理过，请返回 Kiro Admin 标签页"))
-        }
-        RemoteCallbackOutcome::Expired => {
-            Html(render_callback_page(false, "登录会话已过期，请回到管理面板重新发起登录"))
-        }
-        RemoteCallbackOutcome::NotFound => Html(render_callback_page(
-            false,
-            "未找到对应的登录会话（可能未配置回调地址或会话已失效），请回到管理面板重新发起",
-        )),
-    }
-}
-
-/// 渲染 OAuth 回调提示页（成功 / 失败两种样式）
-fn render_callback_page(success: bool, message: &str) -> String {
-    let (title, icon, color) = if success {
-        ("登录回调", "✓", "#34c759")
-    } else {
-        ("登录失败", "✗", "#ff3b30")
-    };
-    format!(
-        "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title></head>\
-         <body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;text-align:center;padding:60px 20px;background:#f5f5f7;margin:0'>\
-         <div style='max-width:420px;margin:0 auto;background:#fff;border-radius:16px;padding:40px 24px;box-shadow:0 1px 3px rgba(0,0,0,.08)'>\
-         <div style='font-size:48px;line-height:1;color:{color};margin-bottom:16px'>{icon}</div>\
-         <h2 style='margin:0 0 12px;font-size:20px;color:#1d1d1f'>{title}</h2>\
-         <p style='margin:0;color:#6e6e73;font-size:15px;line-height:1.5'>{message}</p>\
-         <p style='margin:20px 0 0;color:#aeaeb2;font-size:13px'>此标签页可以关闭。</p>\
-         </div></body></html>"
-    )
 }
 
 /// GET /api/admin/config/global-proxy

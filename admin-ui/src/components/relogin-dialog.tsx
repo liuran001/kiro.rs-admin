@@ -163,8 +163,8 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
       } else {
         window.open(resp.portalUrl, '_blank')
       }
-      // 始终轮询：服务端远程模式（resp.remote）由公网回调路由自动完成，本地模式由本地回调完成。
-      scheduleSocialPoll(resp.sessionId)
+      // 本地访问：本地回调服务器投递，自动轮询完成。远程访问靠下方手动粘贴回调 URL 完成。
+      if (!isRemote) scheduleSocialPoll(resp.sessionId)
     } catch (e) {
       loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
@@ -404,8 +404,8 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                 <ExternalLink className="h-3.5 w-3.5" />
               </a>
             </div>
-            {isRemote && !socialSession.remote ? (
-              // 浏览器远程访问且服务端未配置 callbackBaseUrl：手动粘贴兜底
+            {isRemote ? (
+              // 远程访问：OAuth 回调到 localhost 无法被捕获，需手动粘贴回调 URL 完成
               <div className="space-y-2">
                 <p className="text-sm text-amber-600 dark:text-amber-400">
                   完成登录后，从地址栏复制完整 URL 粘贴到下方：
@@ -421,9 +421,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
             ) : (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                {socialSession.remote
-                  ? '完成登录后浏览器会自动跳回本服务，正在等待自动完成…'
-                  : '正在等待登录完成…'}
+                正在等待登录完成…
               </div>
             )}
           </div>
@@ -550,7 +548,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
           {step === 'waiting' && method === 'social' && (
             <>
               <Button variant="outline" onClick={handleClose} disabled={isCompleting}>取消</Button>
-              {isRemote && socialSession && !socialSession.remote && (
+              {isRemote && (
                 <Button
                   onClick={handleCompleteSocialManually}
                   disabled={isCompleting || !callbackUrl.trim()}
