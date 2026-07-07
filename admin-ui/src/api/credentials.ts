@@ -63,40 +63,57 @@ export async function getCredentials(): Promise<CredentialsStatusResponse> {
   return data
 }
 
-// ============ KAM 导出 ============
+// ============ 凭据导出 ============
 
-/** KAM 导出账号（KAM 1.8.3+ 平铺格式） */
-export interface KamExportAccount {
+export interface CredentialExportSecret {
+  accessToken: string
+  csrfToken: string
+  refreshToken?: string
+  clientId?: string
+  clientSecret?: string
+  region?: string
+  startUrl?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
+  expiresAt: number
+  authMethod?: string
+  provider?: string
+}
+
+/** 后端导出的兼容账号包格式：账号字段在顶层，敏感凭据位于 credentials。 */
+export interface CredentialExportAccount {
+  id: string
   email?: string
   nickname?: string
   idp?: string
-  provider?: string
-  status?: string
-  authMethod?: string
-  region?: string
-  startUrl?: string
-  clientId?: string
-  clientSecret?: string
-  refreshToken?: string
-  accessToken?: string
-  profileArn?: string
-  expiresAt?: string
+  userId?: string
   machineId?: string
+  profileArn?: string
+  credentials: CredentialExportSecret
+  subscription?: unknown
+  usage?: unknown
+  tags?: string[]
+  status?: string
+  createdAt?: number
+  lastUsedAt?: number
 }
 
-export interface KamExportResponse {
+export interface CredentialsExportResponse {
   version: string
-  exportedAt: string
-  accounts: KamExportAccount[]
+  exportedAt: number
+  accounts: CredentialExportAccount[]
+  groups?: unknown[]
+  tags?: unknown[]
 }
 
-/** 导出凭据为 KAM 兼容 JSON（含 refreshToken 等敏感字段）。
+/** 导出凭据为兼容 JSON（含 refreshToken 等敏感字段）。
  *  传入 `ids` 时仅导出这些凭据；省略则导出全部。 */
 export async function exportKamCredentials(
   ids?: number[]
-): Promise<KamExportResponse> {
+): Promise<CredentialsExportResponse> {
   const params = ids && ids.length > 0 ? { ids: ids.join(',') } : undefined
-  const { data } = await api.get<KamExportResponse>('/credentials/export', { params })
+  const { data } = await api.get<CredentialsExportResponse>('/credentials/export', { params })
   return data
 }
 

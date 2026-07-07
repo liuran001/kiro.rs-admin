@@ -127,6 +127,7 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  type CredentialsExportResponse,
   type LoadBalancingMode,
   LB_LABEL,
   nextLbMode,
@@ -1004,7 +1005,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     else toast.warning(`刷新完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
-  const [exportingKam, setExportingKam] = useState(false);
+  type ExportFormat = "generic" | "account-manager";
+  const [exportingFormat, setExportingFormat] = useState<ExportFormat | null>(
+    null,
+  );
 
   const handleUpdateAdminKey = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1027,13 +1031,57 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
-  const handleExportKam = async () => {
+  const exportTimestamp = () =>
+    new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .replace("T", "_")
+      .slice(0, 19);
+
+  const downloadJson = (data: unknown, filename: string) => {
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const toGenericExport = (data: CredentialsExportResponse) =>
+    data.accounts.map((account) => {
+      const c = account.credentials;
+      return {
+        email: account.email || undefined,
+        idp: account.idp || undefined,
+        status: account.status || undefined,
+        machineId: account.machineId || undefined,
+        profileArn: account.profileArn || undefined,
+        authMethod: c.authMethod || undefined,
+        provider: c.provider || account.idp || undefined,
+        refreshToken: c.refreshToken,
+        accessToken: c.accessToken || undefined,
+        expiresAt: c.expiresAt || undefined,
+        clientId: c.clientId || undefined,
+        clientSecret: c.clientSecret || undefined,
+        region: c.region || undefined,
+        startUrl: c.startUrl || undefined,
+        tokenEndpoint: c.tokenEndpoint || undefined,
+        issuerUrl: c.issuerUrl || undefined,
+        scopes: c.scopes || undefined,
+      };
+    });
+
+  const handleExportCredentials = async (format: ExportFormat) => {
     if (selectedIds.size === 0) {
       toast.info("请先勾选要导出的凭据");
       return;
     }
     const ids = Array.from(selectedIds);
-    setExportingKam(true);
+    setExportingFormat(format);
     try {
       const exportData = await exportKamCredentials(ids);
       const accountCount = exportData.accounts?.length ?? 0;
@@ -1041,31 +1089,23 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         toast.warning("勾选的凭据中没有可导出的（缺少 refreshToken）");
         return;
       }
-      const json = JSON.stringify(exportData, null, 2);
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const ts = new Date()
-        .toISOString()
-        .replace(/[:.]/g, "-")
-        .replace("T", "_")
-        .slice(0, 19);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `kiro-account-manager-export-${ts}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      const ts = exportTimestamp();
+      if (format === "generic") {
+        downloadJson(toGenericExport(exportData), `kiro-credentials-${ts}.json`);
+      } else {
+        downloadJson(exportData, `kiro-account-manager-export-${ts}.json`);
+      }
       const skipped = ids.length - accountCount;
+      const label = format === "generic" ? "通用 JSON" : "Account Manager JSON";
       toast.success(
         skipped > 0
-          ? `已导出 ${accountCount} 个账号，${skipped} 个无效已跳过`
-          : `已导出 ${accountCount} 个账号`,
+          ? `已导出 ${accountCount} 个账号为${label}，${skipped} 个无效已跳过`
+          : `已导出 ${accountCount} 个账号为${label}`,
       );
     } catch (err) {
       toast.error("导出失败: " + extractErrorMessage(err));
     } finally {
-      setExportingKam(false);
+      setExportingFormat(null);
     }
   };
 
@@ -1579,11 +1619,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     导入凭据 / Kiro Account Manager
                   </DropdownMenuItem>
                   <DropdownMenuItem
-                    onSelect={handleExportKam}
-                    disabled={exportingKam}
+                    onSelect={() => handleExportCredentials("generic")}
+                    disabled={exportingFormat !== null}
                   >
                     <FileDown />
-                    {exportingKam ? "导出中…" : "Kiro Account Manager 导出"}
+                    {exportingFormat === "generic" ? "导出中…" : "导出通用 JSON"}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => handleExportCredentials("account-manager")}
+                    disabled={exportingFormat !== null}
+                  >
+                    <FileDown />
+                    {exportingFormat === "account-manager"
+                      ? "导出中…"
+                      : "导出 Account Manager JSON"}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
