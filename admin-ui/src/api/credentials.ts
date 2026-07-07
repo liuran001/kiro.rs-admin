@@ -453,6 +453,27 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
   return data
 }
 
+// 代理均衡模式
+export type ProxyBalancingMode = 'sticky' | 'round_robin' | 'least_load'
+
+export const PROXY_BALANCING_LABEL: Record<ProxyBalancingMode, string> = {
+  sticky: '粘性会话',
+  round_robin: '轮询',
+  least_load: '最小负载',
+}
+
+export async function getProxyBalancingMode(): Promise<{ mode: ProxyBalancingMode }> {
+  const { data } = await api.get<{ mode: ProxyBalancingMode }>('/config/proxy-balancing')
+  return data
+}
+
+export async function setProxyBalancingMode(
+  mode: ProxyBalancingMode
+): Promise<{ mode: ProxyBalancingMode }> {
+  const { data } = await api.put<{ mode: ProxyBalancingMode }>('/config/proxy-balancing', { mode })
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number

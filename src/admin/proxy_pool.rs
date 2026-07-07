@@ -9,6 +9,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -93,11 +94,30 @@ enum ProbeResult {
 
 pub struct ProxyPoolManager {
     entries: Mutex<Vec<ProxyEntry>>,
+    runtime: Mutex<ProxyRuntimeState>,
     // 仅需原子自增，不需要与 entries 联锁；约定独立使用，无锁顺序问题
     next_id: AtomicU64,
     path: Option<PathBuf>,
     /// TLS 后端，构建探测用 HTTP client 时需要
     tls_backend: TlsBackend,
+}
+
+#[derive(Default)]
+struct ProxyRuntimeState {
+    round_robin_cursor: usize,
+    in_flight: HashMap<String, usize>,
+    sticky_by_credential: HashMap<u64, String>,
+}
+
+pub struct ProxyInFlightGuard<'a> {
+    manager: &'a ProxyPoolManager,
+    url: String,
+}
+
+impl Drop for ProxyInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.manager.release_in_flight(&self.url);
+    }
 }
 
 /// 校验代理 URL 的 scheme 是否合法
@@ -135,6 +155,7 @@ impl ProxyPoolManager {
 
         Self {
             entries: Mutex::new(entries),
+            runtime: Mutex::new(ProxyRuntimeState::default()),
             next_id: AtomicU64::new(next_id),
             path,
             tls_backend,
@@ -225,11 +246,17 @@ impl ProxyPoolManager {
     pub fn delete(&self, id: u64) -> anyhow::Result<()> {
         let mut entries = self.entries.lock();
         let len_before = entries.len();
+        let removed_urls: Vec<String> = entries
+            .iter()
+            .filter(|e| e.id == id)
+            .map(|e| e.url.clone())
+            .collect();
         entries.retain(|e| e.id != id);
         if entries.len() == len_before {
             anyhow::bail!("代理不存在: {}", id);
         }
         drop(entries);
+        self.clear_runtime_for_urls(&removed_urls);
         self.persist()?;
         Ok(())
     }
@@ -248,6 +275,8 @@ impl ProxyPoolManager {
         if enabled {
             entry.auto_disabled = false;
             entry.consecutive_failures = 0;
+        } else {
+            self.clear_runtime_for_urls(&[entry.url.clone()]);
         }
         drop(entries);
         self.persist()?;
@@ -271,6 +300,175 @@ impl ProxyPoolManager {
             .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy)
             .map(|e| e.url.clone())
             .collect()
+    }
+
+    fn clear_runtime_for_urls(&self, urls: &[String]) {
+        if urls.is_empty() {
+            return;
+        }
+        let mut runtime = self.runtime.lock();
+        runtime
+            .sticky_by_credential
+            .retain(|_, sticky_url| !urls.iter().any(|url| url == sticky_url));
+        for url in urls {
+            runtime.in_flight.remove(url);
+        }
+    }
+
+    fn is_assignable_locked(entries: &[ProxyEntry], url: &str) -> bool {
+        match entries.iter().find(|e| e.url == url) {
+            Some(e) => e.enabled && e.health != ProxyHealth::Unhealthy,
+            None => true,
+        }
+    }
+
+    fn latency_for_locked(entries: &[ProxyEntry], url: &str) -> u32 {
+        entries
+            .iter()
+            .find(|e| e.url == url)
+            .and_then(|e| e.latency_ms)
+            .unwrap_or(u32::MAX)
+    }
+
+    /// 按代理均衡模式排列候选代理。
+    ///
+    /// - `round_robin`：进程内轮询游标。
+    /// - `least_load`：当前 in-flight 最少优先，延迟作为次序。
+    /// - `sticky`：若该凭据已有成功代理且仍可用，优先使用；否则先按 least_load 选，
+    ///   成功后由 `report_proxy_success` 绑定。
+    pub fn order_candidates(
+        &self,
+        credential_id: u64,
+        candidates: Vec<ProxyConfig>,
+        mode: &str,
+    ) -> Vec<ProxyConfig> {
+        let entries = self.entries.lock();
+        let mut available = Vec::new();
+        for candidate in candidates {
+            if !Self::is_assignable_locked(&entries, &candidate.url) {
+                continue;
+            }
+            if !available
+                .iter()
+                .any(|existing: &ProxyConfig| existing == &candidate)
+            {
+                available.push(candidate);
+            }
+        }
+
+        if available.len() <= 1 {
+            return available;
+        }
+
+        let mut runtime = self.runtime.lock();
+        let load = |url: &str, state: &ProxyRuntimeState| {
+            (
+                *state.in_flight.get(url).unwrap_or(&0),
+                Self::latency_for_locked(&entries, url),
+                url.to_string(),
+            )
+        };
+
+        match mode {
+            "round_robin" => {
+                let offset = runtime.round_robin_cursor % available.len();
+                runtime.round_robin_cursor = runtime.round_robin_cursor.wrapping_add(1);
+                available.rotate_left(offset);
+                available
+            }
+            "least_load" => {
+                available.sort_by_key(|proxy| load(&proxy.url, &runtime));
+                available
+            }
+            "sticky" => {
+                if let Some(sticky_url) = runtime.sticky_by_credential.get(&credential_id).cloned()
+                    && let Some(pos) = available.iter().position(|proxy| proxy.url == sticky_url)
+                {
+                    let sticky = available.remove(pos);
+                    available.sort_by_key(|proxy| load(&proxy.url, &runtime));
+                    available.insert(0, sticky);
+                    return available;
+                }
+                available.sort_by_key(|proxy| load(&proxy.url, &runtime));
+                available
+            }
+            _ => {
+                available.sort_by_key(|proxy| load(&proxy.url, &runtime));
+                available
+            }
+        }
+    }
+
+    pub fn in_flight_guard(&self, proxy: &ProxyConfig) -> ProxyInFlightGuard<'_> {
+        let url = proxy.url.clone();
+        let mut runtime = self.runtime.lock();
+        *runtime.in_flight.entry(url.clone()).or_insert(0) += 1;
+        ProxyInFlightGuard { manager: self, url }
+    }
+
+    fn release_in_flight(&self, url: &str) {
+        let mut runtime = self.runtime.lock();
+        if let Some(count) = runtime.in_flight.get_mut(url) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                runtime.in_flight.remove(url);
+            }
+        }
+    }
+
+    pub fn report_proxy_success(&self, credential_id: u64, proxy: &ProxyConfig) {
+        {
+            let mut runtime = self.runtime.lock();
+            runtime
+                .sticky_by_credential
+                .insert(credential_id, proxy.url.clone());
+        }
+
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.url == proxy.url) {
+            entry.health = ProxyHealth::Healthy;
+            entry.consecutive_failures = 0;
+        }
+    }
+
+    /// 记录运行时代理失败。若该 URL 存在于代理池，连续失败达到阈值会自动禁用并持久化。
+    pub fn report_proxy_failure(&self, credential_id: u64, proxy: &ProxyConfig) {
+        {
+            let mut runtime = self.runtime.lock();
+            if runtime
+                .sticky_by_credential
+                .get(&credential_id)
+                .map(|url| url == &proxy.url)
+                .unwrap_or(false)
+            {
+                runtime.sticky_by_credential.remove(&credential_id);
+            }
+        }
+
+        let mut changed = false;
+        let mut disabled_url: Option<String> = None;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.url == proxy.url) {
+                let (_, newly_disabled) = Self::apply_probe_result(
+                    entry,
+                    &ProbeResult::Err {
+                        error: "运行时请求失败".to_string(),
+                    },
+                );
+                changed = true;
+                if newly_disabled {
+                    disabled_url = Some(entry.url.clone());
+                }
+            }
+        }
+
+        if let Some(url) = disabled_url {
+            self.clear_runtime_for_urls(&[url]);
+        }
+        if changed && let Err(e) = self.persist() {
+            tracing::warn!("记录运行时代理失败后持久化失败: {}", e);
+        }
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -385,6 +583,7 @@ impl ProxyPoolManager {
         let results = futures::future::join_all(probes).await;
 
         let mut summary = CheckSummary::default();
+        let mut disabled_urls = Vec::new();
         {
             let mut entries = self.entries.lock();
             for (id, result) in &results {
@@ -397,10 +596,12 @@ impl ProxyPoolManager {
                     }
                     if newly_disabled {
                         summary.auto_disabled += 1;
+                        disabled_urls.push(entry.url.clone());
                     }
                 }
             }
         }
+        self.clear_runtime_for_urls(&disabled_urls);
 
         if let Err(e) = self.persist() {
             tracing::warn!("健康检查后持久化失败: {}", e);
@@ -426,7 +627,10 @@ impl ProxyPoolManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
-            Self::apply_probe_result(entry, &result);
+            let (_, newly_disabled) = Self::apply_probe_result(entry, &result);
+            if newly_disabled {
+                self.clear_runtime_for_urls(&[entry.url.clone()]);
+            }
             entry.clone()
         };
 
@@ -523,5 +727,41 @@ mod tests {
         assert!(e.enabled);
         assert!(!e.auto_disabled);
         assert_eq!(e.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn sticky_mode_reuses_success_proxy_until_failure() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        mgr.add("http://proxy-a:8080".to_string(), None).unwrap();
+        mgr.add("http://proxy-b:8080".to_string(), None).unwrap();
+        let proxy_a = ProxyConfig::new("http://proxy-a:8080");
+        let proxy_b = ProxyConfig::new("http://proxy-b:8080");
+
+        mgr.report_proxy_success(7, &proxy_b);
+        let ordered = mgr.order_candidates(7, vec![proxy_a.clone(), proxy_b.clone()], "sticky");
+        assert_eq!(
+            ordered.first().map(|p| p.url.as_str()),
+            Some(proxy_b.url.as_str())
+        );
+
+        mgr.report_proxy_failure(7, &proxy_b);
+        let ordered = mgr.order_candidates(7, vec![proxy_a.clone(), proxy_b], "sticky");
+        assert_eq!(ordered, vec![proxy_a]);
+    }
+
+    #[test]
+    fn least_load_mode_prefers_lower_in_flight_proxy() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        mgr.add("http://proxy-a:8080".to_string(), None).unwrap();
+        mgr.add("http://proxy-b:8080".to_string(), None).unwrap();
+        let proxy_a = ProxyConfig::new("http://proxy-a:8080");
+        let proxy_b = ProxyConfig::new("http://proxy-b:8080");
+
+        let _guard = mgr.in_flight_guard(&proxy_a);
+        let ordered = mgr.order_candidates(1, vec![proxy_a.clone(), proxy_b.clone()], "least_load");
+        assert_eq!(
+            ordered.first().map(|p| p.url.as_str()),
+            Some(proxy_b.url.as_str())
+        );
     }
 }

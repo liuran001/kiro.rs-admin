@@ -125,9 +125,13 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 凭据负载均衡模式（"priority" / "balanced" / "least_conn"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 代理均衡模式（"sticky" / "round_robin" / "least_load"）
+    #[serde(default = "default_proxy_balancing_mode")]
+    pub proxy_balancing_mode: String,
 
     /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
     ///
@@ -220,6 +224,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_proxy_balancing_mode() -> String {
+    "sticky".to_string()
+}
+
 fn default_account_throttle_failover() -> bool {
     true
 }
@@ -283,6 +291,7 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            proxy_balancing_mode: default_proxy_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),

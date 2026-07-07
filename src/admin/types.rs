@@ -494,6 +494,22 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+/// 代理均衡模式响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyBalancingModeResponse {
+    /// 当前模式（"sticky" / "round_robin" / "least_load"）
+    pub mode: String,
+}
+
+/// 设置代理均衡模式请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyBalancingModeRequest {
+    /// 模式（"sticky" / "round_robin" / "least_load"）
+    pub mode: String,
+}
+
 /// 账号级风控故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

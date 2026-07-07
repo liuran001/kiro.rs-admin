@@ -32,9 +32,13 @@ import {
   setProxyEnabled,
   getGlobalProxy,
   setGlobalProxy,
+  getProxyBalancingMode,
+  setProxyBalancingMode,
+  PROXY_BALANCING_LABEL,
   checkProxy,
   checkAllProxies,
   assignProxiesRoundRobin,
+  type ProxyBalancingMode,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import type { ProxyPoolEntry } from '@/types/api'
@@ -57,6 +61,7 @@ function maskProxyCandidate(candidate: string): string {
   return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
 }
 
+const PROXY_MODE_OPTIONS: ProxyBalancingMode[] = ['sticky', 'round_robin', 'least_load']
 
 export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPoolDialogProps) {
   const [newUrl, setNewUrl] = useState('')
@@ -77,6 +82,21 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     queryKey: ['global-proxy'],
     queryFn: getGlobalProxy,
     enabled: open,
+  })
+
+  const { data: proxyBalancingData, isLoading: proxyBalancingLoading } = useQuery({
+    queryKey: ['proxy-balancing'],
+    queryFn: getProxyBalancingMode,
+    enabled: open,
+  })
+
+  const setProxyBalancingMutation = useMutation({
+    mutationFn: setProxyBalancingMode,
+    onSuccess: (res) => {
+      toast.success(`代理策略已切换为${PROXY_BALANCING_LABEL[res.mode]}`)
+      queryClient.invalidateQueries({ queryKey: ['proxy-balancing'] })
+    },
+    onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
   })
 
   const setGlobalProxyMutation = useMutation({
@@ -217,6 +237,38 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-2">
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium">代理选择策略</div>
+              </div>
+              <Badge variant="secondary" className="shrink-0">
+                {PROXY_BALANCING_LABEL[proxyBalancingData?.mode ?? 'sticky']}
+              </Badge>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {PROXY_MODE_OPTIONS.map((mode) => (
+                <Button
+                  key={mode}
+                  type="button"
+                  size="sm"
+                  variant={(proxyBalancingData?.mode ?? 'sticky') === mode ? 'default' : 'outline'}
+                  disabled={proxyBalancingLoading || setProxyBalancingMutation.isPending}
+                  onClick={() => setProxyBalancingMutation.mutate(mode)}
+                  title={
+                    mode === 'sticky'
+                      ? '账号成功命中代理后固定使用，失败后再换'
+                      : mode === 'round_robin'
+                        ? '按代理候选轮询分配'
+                        : '优先选择当前请求数最少的代理'
+                  }
+                >
+                  {PROXY_BALANCING_LABEL[mode]}
+                </Button>
+              ))}
+            </div>
+          </div>
+
           {/* 单条添加 */}
           {!showBatch && (
             <form onSubmit={handleAdd} className="flex gap-2">

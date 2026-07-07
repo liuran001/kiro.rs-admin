@@ -25,9 +25,9 @@ use super::{
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        SetProxyBalancingModeRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -536,6 +536,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/proxy-balancing
+/// 获取代理均衡模式
+pub async fn get_proxy_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_balancing_mode())
+}
+
+/// PUT /api/admin/config/proxy-balancing
+/// 设置代理均衡模式
+pub async fn set_proxy_balancing_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProxyBalancingModeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

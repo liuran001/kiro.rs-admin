@@ -30,9 +30,10 @@ use super::types::{
     CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
     CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
+    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -186,7 +187,7 @@ pub struct AdminService {
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     /// 代理 IP 池管理器
-    proxy_pool: ProxyPoolManager,
+    proxy_pool: Arc<ProxyPoolManager>,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
     /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
@@ -513,13 +514,11 @@ impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        proxy_pool: Arc<ProxyPoolManager>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
             .map(|d| d.join("kiro_balance_cache.json"));
-
-        let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
-        let token_manager_tls_backend = token_manager.config().tls_backend;
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
@@ -529,7 +528,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
-            proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
+            proxy_pool,
             update_config: Mutex::new(update_config),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1973,6 +1972,31 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取代理均衡模式
+    pub fn get_proxy_balancing_mode(&self) -> ProxyBalancingModeResponse {
+        ProxyBalancingModeResponse {
+            mode: self.token_manager.get_proxy_balancing_mode(),
+        }
+    }
+
+    /// 设置代理均衡模式
+    pub fn set_proxy_balancing_mode(
+        &self,
+        req: SetProxyBalancingModeRequest,
+    ) -> Result<ProxyBalancingModeResponse, AdminServiceError> {
+        if req.mode != "sticky" && req.mode != "round_robin" && req.mode != "least_load" {
+            return Err(AdminServiceError::InvalidCredential(
+                "mode 必须是 'sticky'、'round_robin' 或 'least_load'".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_proxy_balancing_mode(req.mode.clone())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(ProxyBalancingModeResponse { mode: req.mode })
     }
 
     /// 获取账号级风控故障转移配置

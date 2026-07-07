@@ -1010,6 +1010,8 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 代理均衡模式（运行时可修改）
+    proxy_balancing_mode: Mutex<String>,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
@@ -1217,6 +1219,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let proxy_balancing_mode = config.proxy_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let manager = Self {
@@ -1230,6 +1233,7 @@ impl MultiTokenManager {
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            proxy_balancing_mode: Mutex::new(proxy_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
@@ -3585,6 +3589,53 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    pub fn get_proxy_balancing_mode(&self) -> String {
+        self.proxy_balancing_mode.lock().clone()
+    }
+
+    fn persist_proxy_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，代理均衡模式仅在当前进程生效: {}", mode);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.proxy_balancing_mode = mode.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化代理均衡模式失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 设置代理均衡模式（Admin API）
+    pub fn set_proxy_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
+        if mode != "sticky" && mode != "round_robin" && mode != "least_load" {
+            anyhow::bail!("无效的代理均衡模式: {}", mode);
+        }
+
+        let previous_mode = self.get_proxy_balancing_mode();
+        if previous_mode == mode {
+            return Ok(());
+        }
+
+        *self.proxy_balancing_mode.lock() = mode.clone();
+
+        if let Err(err) = self.persist_proxy_balancing_mode(&mode) {
+            *self.proxy_balancing_mode.lock() = previous_mode;
+            return Err(err);
+        }
+
+        tracing::info!("代理均衡模式已设置为: {}", mode);
+        Ok(())
+    }
+
     /// 获取账号级风控故障转移配置（Admin API）
     pub fn get_account_throttle_failover(&self) -> bool {
         self.account_throttle_failover.load(Ordering::Relaxed)
@@ -4072,6 +4123,36 @@ mod tests {
         assert!(
             manager
                 .set_load_balancing_mode("bogus".to_string())
+                .is_err()
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_proxy_balancing_mode_persists() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-proxy-balancing-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, r#"{"proxyBalancingMode":"sticky"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .set_proxy_balancing_mode("least_load".to_string())
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.proxy_balancing_mode, "least_load");
+        assert_eq!(manager.get_proxy_balancing_mode(), "least_load");
+
+        assert!(
+            manager
+                .set_proxy_balancing_mode("bogus".to_string())
                 .is_err()
         );
 

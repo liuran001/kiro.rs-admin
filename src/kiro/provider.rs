@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+use crate::admin::proxy_pool::{ProxyInFlightGuard, ProxyPoolManager};
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::anthropic::converter::normalize_model_id;
 use crate::http_client::{ProxyConfig, build_client};
@@ -130,6 +131,8 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 代理池运行时状态；用于代理健康过滤、均衡、粘性与失败自动禁用。
+    proxy_pool: Option<Arc<ProxyPoolManager>>,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -151,6 +154,7 @@ impl KiroProvider {
         proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
+        proxy_pool: Option<Arc<ProxyPoolManager>>,
     ) -> Self {
         assert!(
             endpoints.contains_key(&default_endpoint),
@@ -169,6 +173,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            proxy_pool,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -212,14 +217,28 @@ impl KiroProvider {
         if out.is_empty() { vec![None] } else { out }
     }
 
-    fn proxy_candidates_for(&self, credentials: &KiroCredentials) -> Vec<Option<ProxyConfig>> {
+    fn proxy_candidates_for(
+        &self,
+        credential_id: u64,
+        credentials: &KiroCredentials,
+    ) -> Vec<Option<ProxyConfig>> {
         let global = self.global_proxy_candidates();
         let mut candidates = credentials.effective_proxy_candidates(&global);
 
         let has_direct = candidates.iter().any(|candidate| candidate.is_none());
         candidates.retain(|candidate| candidate.is_some());
 
-        if candidates.len() > 1 {
+        let proxy_candidates: Vec<ProxyConfig> = candidates.into_iter().flatten().collect();
+        let ordered = if let Some(pool) = &self.proxy_pool {
+            let mode = self.token_manager.get_proxy_balancing_mode();
+            pool.order_candidates(credential_id, proxy_candidates, &mode)
+        } else {
+            proxy_candidates
+        };
+
+        let mut candidates: Vec<Option<ProxyConfig>> = ordered.into_iter().map(Some).collect();
+
+        if self.proxy_pool.is_none() && candidates.len() > 1 {
             let offset = fastrand::usize(..candidates.len());
             candidates.rotate_left(offset);
         }
@@ -232,6 +251,25 @@ impl KiroProvider {
             candidates.push(None);
         }
         candidates
+    }
+
+    fn proxy_in_flight_guard(&self, proxy: Option<&ProxyConfig>) -> Option<ProxyInFlightGuard<'_>> {
+        self.proxy_pool
+            .as_ref()
+            .zip(proxy)
+            .map(|(pool, proxy)| pool.in_flight_guard(proxy))
+    }
+
+    fn report_proxy_success(&self, credential_id: u64, proxy: Option<&ProxyConfig>) {
+        if let (Some(pool), Some(proxy)) = (&self.proxy_pool, proxy) {
+            pool.report_proxy_success(credential_id, proxy);
+        }
+    }
+
+    fn report_proxy_failure(&self, credential_id: u64, proxy: Option<&ProxyConfig>) {
+        if let (Some(pool), Some(proxy)) = (&self.proxy_pool, proxy) {
+            pool.report_proxy_failure(credential_id, proxy);
+        }
     }
 
     /// 用指定 endpoint 构造并发送一次 API 请求，返回原始响应（不读取 body）。
@@ -289,11 +327,13 @@ impl KiroProvider {
         config: &crate::model::config::Config,
         request_body: &str,
     ) -> anyhow::Result<ProxyAttemptResult> {
-        let candidates = self.proxy_candidates_for(&ctx.credentials);
+        let candidates = self.proxy_candidates_for(ctx.id, &ctx.credentials);
         let candidate_count = candidates.len();
         let mut last_error: Option<anyhow::Error> = None;
 
         for (idx, proxy) in candidates.into_iter().enumerate() {
+            let proxy_for_guard = proxy.clone();
+            let _proxy_in_flight = self.proxy_in_flight_guard(proxy_for_guard.as_ref());
             if idx > 0 {
                 tracing::info!(
                     "凭据 #{} 使用下一个代理候选重试: {}",
@@ -315,6 +355,9 @@ impl KiroProvider {
             {
                 Ok(response) => {
                     let status = response.status();
+                    if should_try_next_proxy(status) {
+                        self.report_proxy_failure(ctx.id, proxy.as_ref());
+                    }
                     if idx + 1 < candidate_count && should_try_next_proxy(status) {
                         tracing::warn!(
                             "凭据 #{} 代理候选 {} 返回 HTTP {}，切换下一个候选",
@@ -328,9 +371,13 @@ impl KiroProvider {
                         ));
                         continue;
                     }
+                    if !should_try_next_proxy(status) {
+                        self.report_proxy_success(ctx.id, proxy.as_ref());
+                    }
                     return Ok(ProxyAttemptResult { response, proxy });
                 }
                 Err(err) => {
+                    self.report_proxy_failure(ctx.id, proxy.as_ref());
                     tracing::warn!(
                         "凭据 #{} 代理候选 {} 请求发送失败: {}",
                         ctx.id,
@@ -361,11 +408,13 @@ impl KiroProvider {
         };
         let url = endpoint.mcp_url(&rctx);
         let body = endpoint.transform_mcp_body(request_body, &rctx);
-        let candidates = self.proxy_candidates_for(&ctx.credentials);
+        let candidates = self.proxy_candidates_for(ctx.id, &ctx.credentials);
         let candidate_count = candidates.len();
         let mut last_error: Option<anyhow::Error> = None;
 
         for (idx, proxy) in candidates.into_iter().enumerate() {
+            let proxy_for_guard = proxy.clone();
+            let _proxy_in_flight = self.proxy_in_flight_guard(proxy_for_guard.as_ref());
             if idx > 0 {
                 tracing::info!(
                     "MCP 凭据 #{} 使用下一个代理候选重试: {}",
@@ -383,6 +432,9 @@ impl KiroProvider {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    if should_try_next_proxy(status) {
+                        self.report_proxy_failure(ctx.id, proxy.as_ref());
+                    }
                     if idx + 1 < candidate_count && should_try_next_proxy(status) {
                         tracing::warn!(
                             "MCP 凭据 #{} 代理候选 {} 返回 HTTP {}，切换下一个候选",
@@ -396,9 +448,13 @@ impl KiroProvider {
                         ));
                         continue;
                     }
+                    if !should_try_next_proxy(status) {
+                        self.report_proxy_success(ctx.id, proxy.as_ref());
+                    }
                     return Ok(response);
                 }
                 Err(err) => {
+                    self.report_proxy_failure(ctx.id, proxy.as_ref());
                     tracing::warn!(
                         "MCP 凭据 #{} 代理候选 {} 请求发送失败: {}",
                         ctx.id,

@@ -163,11 +163,17 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    let proxy_pool_path = token_manager.cache_dir().map(|d| d.join("proxy_pool.json"));
+    let proxy_pool = Arc::new(admin::proxy_pool::ProxyPoolManager::new(
+        proxy_pool_path,
+        config.tls_backend,
+    ));
     let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
+        Some(proxy_pool.clone()),
     ));
 
     // 初始化 count_tokens 配置
@@ -290,13 +296,16 @@ async fn main() {
                     admin::TraceStore::open_in_memory().expect("内存 trace store 初始化失败"),
                 )
             });
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
-                    .with_kiro_provider(kiro_provider.clone())
-                    .with_log_governance(
-                        Some(admin_trace_store.clone()),
-                        Some(usage_recorder.clone()),
-                    );
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                proxy_pool.clone(),
+            )
+            .with_kiro_provider(kiro_provider.clone())
+            .with_log_governance(
+                Some(admin_trace_store.clone()),
+                Some(usage_recorder.clone()),
+            );
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
