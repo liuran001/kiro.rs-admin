@@ -140,12 +140,20 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
       await navigator.clipboard.writeText(url)
       setCopyState('copied')
-      toast.success('登录链接已复制，请在无痕窗口粘贴打开')
+      toast.success('链接已复制')
       setTimeout(() => setCopyState('idle'), 2000)
     } catch {
       setCopyState('manual')
       selectLoginLink()
       toast.error('浏览器拒绝写入剪贴板，已选中链接，请按 Ctrl+C 复制')
+    }
+  }
+
+  const handleOpenLink = (url: string) => {
+    const opened = window.open(url, '_blank')
+    if (!opened) {
+      void handleCopyLink(url)
+      toast.error('浏览器拦截了新窗口，链接已保留在下方')
     }
   }
 
@@ -188,12 +196,8 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
           schedulePoll(sessionId)
         } else if (result.status === 'continue') {
           setNextUrl(result.nextUrl)
-          toast.success('已获取二段登录链接')
-          if (!isRemote && !incognito) {
-            window.open(result.nextUrl, '_blank')
-          } else if (incognito) {
-            await handleCopyLink(result.nextUrl)
-          }
+          setCopyState('idle')
+          toast.success('已获取二段登录链接，请点击打开或复制')
           if (!isRemote) schedulePoll(sessionId)
         } else if (result.status === 'success') {
           setCredentialId(result.credentialId)
@@ -234,10 +238,9 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       })
       if (result.status === 'continue') {
         setNextUrl(result.nextUrl)
+        setCopyState('idle')
         setCallbackUrl('')
-        toast.success('已获取二段登录链接，请打开后继续授权')
-        if (incognito) await handleCopyLink(result.nextUrl)
-        else window.open(result.nextUrl, '_blank')
+        toast.success('已获取二段登录链接，请点击打开或复制')
         if (!isRemote) schedulePoll(session.sessionId)
       } else if (result.status === 'success') {
         setCredentialId(result.credentialId)
@@ -297,21 +300,47 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
         {step === 'waiting' && session && (
           <div className="space-y-4 py-2">
-            {incognito ? (
+            {nextUrl ? (
+              <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
+                <p className="text-sm font-medium">二段登录链接</p>
+                <textarea
+                  ref={loginLinkRef}
+                  readOnly
+                  value={nextUrl}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" onClick={() => handleOpenLink(nextUrl)}>
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    打开二段链接
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => handleCopyLink(nextUrl)}>
+                    {copyState === 'copied' ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    {copyState === 'copied' ? '已复制' : '复制链接'}
+                  </Button>
+                  {copyState === 'manual' && (
+                    <span className="text-xs text-muted-foreground">
+                      链接已选中，可直接按 Ctrl+C
+                    </span>
+                  )}
+                </div>
+              </div>
+            ) : incognito ? (
               <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
                 <p className="text-sm text-muted-foreground">
-                  {nextUrl
-                    ? '二段登录链接已生成。'
-                    : copyState === 'copied'
-                      ? '登录链接已复制。'
-                      : '复制登录链接后，'}
+                  {copyState === 'copied' ? '登录链接已复制。' : '复制登录链接后，'}
                   请新开一个<span className="font-medium text-foreground">无痕 / 隐身窗口</span>
                   （Ctrl+Shift+N，Safari 为 ⌘+Shift+N），粘贴打开并完成授权。
                 </p>
                 <textarea
                   ref={loginLinkRef}
                   readOnly
-                  value={nextUrl || session.portalUrl}
+                  value={session.portalUrl}
                   onFocus={(e) => e.currentTarget.select()}
                   className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
                 />
@@ -319,14 +348,14 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleCopyLink(nextUrl || session.portalUrl)}
+                    onClick={() => handleCopyLink(session.portalUrl)}
                   >
                     {copyState === 'copied' ? (
                       <Check className="h-3.5 w-3.5" />
                     ) : (
                       <Copy className="h-3.5 w-3.5" />
                     )}
-                    {copyState === 'copied' ? '已复制' : nextUrl ? '复制二段链接' : '复制登录链接'}
+                    {copyState === 'copied' ? '已复制' : '复制登录链接'}
                   </Button>
                   {copyState === 'manual' && (
                     <span className="text-xs text-muted-foreground">
@@ -367,22 +396,6 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
                     ? '完成登录后，浏览器可能会跳转到 localhost 页面，请从地址栏复制完整 URL 粘贴到下方。企业 SSO 的第一段中间链接也可以直接粘贴：'
                     : '如果浏览器停在 localhost 页面，也可以把完整 URL 粘贴到下方。企业 SSO 的第一段中间链接可直接粘贴：'}
               </p>
-              {nextUrl && (
-                <div className="rounded-lg border bg-muted/50 p-3 space-y-2">
-                  <p className="text-xs font-medium text-muted-foreground">二段登录链接</p>
-                  <textarea
-                    ref={loginLinkRef}
-                    readOnly
-                    value={nextUrl}
-                    onFocus={(e) => e.currentTarget.select()}
-                    className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
-                  />
-                  <Button size="sm" variant="outline" onClick={() => handleCopyLink(nextUrl)}>
-                    <Copy className="h-3.5 w-3.5" />
-                    复制二段链接
-                  </Button>
-                </div>
-              )}
               <textarea
                 placeholder={nextUrl
                   ? "http://localhost:3128/oauth/callback?code=...&state=..."

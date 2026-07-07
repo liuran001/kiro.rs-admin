@@ -136,6 +136,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   const [manualLog, setManualLog] = useState<string[]>([])
 
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const nextLinkRef = useRef<HTMLTextAreaElement | null>(null)
   const isRemote = isRemoteAccess()
 
   const queryClient = useQueryClient()
@@ -155,6 +156,31 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   }, [])
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+  const selectNextLink = () => {
+    window.requestAnimationFrame(() => {
+      nextLinkRef.current?.focus()
+      nextLinkRef.current?.select()
+    })
+  }
+
+  const copyLink = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url)
+      toast.success('链接已复制')
+    } catch {
+      selectNextLink()
+      toast.error('浏览器拒绝写入剪贴板，已选中链接，请按 Ctrl+C 复制')
+    }
+  }
+
+  const openLink = (url: string) => {
+    const opened = window.open(url, '_blank')
+    if (!opened) {
+      void copyLink(url)
+      toast.error('浏览器拦截了新窗口，链接已保留在下方')
+    }
+  }
 
   const handleClose = () => {
     clearPollTimer()
@@ -204,11 +230,8 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
           scheduleSocialPoll(sessionId)
         } else if (result.status === 'continue') {
           setNextUrl(result.nextUrl)
-          toast.success('已获取二段登录链接')
-          if (!isRemote) {
-            window.open(result.nextUrl, '_blank')
-            scheduleSocialPoll(sessionId)
-          }
+          toast.success('已获取二段登录链接，请点击打开或复制')
+          if (!isRemote) scheduleSocialPoll(sessionId)
         } else if (result.status === 'success') {
           setStep('done')
           invalidate()
@@ -248,8 +271,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
       if (result.status === 'continue') {
         setNextUrl(result.nextUrl)
         setCallbackUrl('')
-        toast.success('已获取二段登录链接，请打开后继续授权')
-        window.open(result.nextUrl, '_blank')
+        toast.success('已获取二段登录链接，请点击打开或复制')
         if (!isRemote) scheduleSocialPoll(socialSession.sessionId)
       } else if (result.status === 'success') {
         setStep('done')
@@ -433,18 +455,41 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
         {/* Social 等待 */}
         {step === 'waiting' && method === 'social' && socialSession && (
           <div className="space-y-4 py-2">
-            <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
-              <p className="text-sm text-muted-foreground">浏览器应已自动打开 Kiro 登录页，请完成授权。</p>
-              <a
-                href={socialSession.portalUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
-              >
-                重新打开登录页
-                <ExternalLink className="h-3.5 w-3.5" />
-              </a>
-            </div>
+            {nextUrl ? (
+              <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
+                <p className="text-sm font-medium">二段登录链接</p>
+                <textarea
+                  ref={nextLinkRef}
+                  readOnly
+                  value={nextUrl}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
+                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" onClick={() => openLink(nextUrl)}>
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    打开二段链接
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => copyLink(nextUrl)}>
+                    <Copy className="h-3.5 w-3.5" />
+                    复制链接
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
+                <p className="text-sm text-muted-foreground">浏览器应已自动打开 Kiro 登录页，请完成授权。</p>
+                <a
+                  href={socialSession.portalUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
+                >
+                  重新打开登录页
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            )}
             {!isRemote && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -459,21 +504,6 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                     ? '完成登录后，从地址栏复制完整 URL 粘贴到下方。企业 SSO 的第一段中间链接也可以直接粘贴：'
                     : '如果浏览器停在 localhost 页面，也可以把完整 URL 粘贴到下方。企业 SSO 的第一段中间链接可直接粘贴：'}
               </p>
-              {nextUrl && (
-                <div className="rounded-lg border bg-muted/50 p-3 space-y-2">
-                  <p className="text-xs font-medium text-muted-foreground">二段登录链接</p>
-                  <textarea
-                    readOnly
-                    value={nextUrl}
-                    onFocus={(e) => e.currentTarget.select()}
-                    className="flex min-h-[72px] w-full resize-none rounded-md border border-input bg-background px-3 py-2 text-xs font-mono text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30"
-                  />
-                  <Button size="sm" variant="outline" onClick={() => navigator.clipboard?.writeText(nextUrl)}>
-                    <Copy className="h-3.5 w-3.5" />
-                    复制二段链接
-                  </Button>
-                </div>
-              )}
               <textarea
                 placeholder={nextUrl
                   ? "http://localhost:3128/oauth/callback?code=...&state=..."
