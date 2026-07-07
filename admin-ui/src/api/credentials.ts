@@ -221,6 +221,10 @@ export interface BatchImportSummary {
 
 export interface BatchImportCredentialsRequest {
   credentials: AddCredentialRequest[]
+  /** 顶层统一代理覆盖；缺省时尊重每条凭据字段 */
+  proxyUrl?: string
+  /** 顶层统一 RPM 覆盖；缺省时尊重每条凭据字段 */
+  rpmLimit?: number
   /** 并发度，缺省 8，服务端 clamp 到 [1, 16] */
   concurrency?: number
   /** 是否验活。true（缺省）：add 后取余额校验 + 失败回滚；false：仅 add 落库（直接导入） */

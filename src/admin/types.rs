@@ -302,6 +302,12 @@ pub struct AddCredentialResponse {
 pub struct BatchImportRequest {
     /// 待导入凭据（复用单条添加的富类型）
     pub credentials: Vec<AddCredentialRequest>,
+    /// 顶层统一代理覆盖；为空或缺省时尊重单条凭据字段
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// 顶层统一 RPM 覆盖；缺省时尊重单条凭据字段
+    #[serde(default)]
+    pub rpm_limit: Option<u32>,
     /// 并发度，缺省 8，服务端 clamp 到 [1, 16]
     #[serde(default)]
     pub concurrency: Option<u8>,
@@ -1231,5 +1237,22 @@ mod tests {
         assert_eq!(req.machine_id.as_deref(), Some("machine"));
         assert_eq!(req.proxy_url.as_deref(), Some("direct"));
         assert_eq!(req.kiro_api_key.as_deref(), Some("ksk_test"));
+    }
+
+    #[test]
+    fn test_batch_import_request_accepts_uniform_proxy_and_rpm() {
+        let json = r#"{
+            "proxyUrl": "direct",
+            "rpmLimit": 3,
+            "credentials": [
+                { "refreshToken": "rt", "authMethod": "social" }
+            ]
+        }"#;
+
+        let req: BatchImportRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(req.proxy_url.as_deref(), Some("direct"));
+        assert_eq!(req.rpm_limit, Some(3));
+        assert_eq!(req.credentials.len(), 1);
     }
 }

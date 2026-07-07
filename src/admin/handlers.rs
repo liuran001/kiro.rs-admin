@@ -229,18 +229,33 @@ pub async fn batch_import_credentials(
     Json(req): Json<BatchImportRequest>,
 ) -> Response {
     let concurrency = req.concurrency.unwrap_or(8).clamp(1, 16) as usize;
-    let total = req.credentials.len();
     let verify = req.verify;
+    let proxy_override = req
+        .proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+    let rpm_override = req.rpm_limit;
+    let credentials = req.credentials;
+    let total = credentials.len();
 
     let (tx, rx) = futures::channel::mpsc::unbounded::<BatchImportEvent>();
     let service = state.service.clone();
 
     // 单个 orchestrator 任务：buffer_unordered 提供有界并发，逐条把结果写回 SSE 流。
     tokio::spawn(async move {
-        let mut work = futures::stream::iter(req.credentials.into_iter().enumerate())
-            .map(|(index, cred_req)| {
+        let mut work = futures::stream::iter(credentials.into_iter().enumerate())
+            .map(move |(index, mut cred_req)| {
                 let service = Arc::clone(&service);
+                let proxy_override = proxy_override.clone();
                 async move {
+                    if let Some(proxy_url) = proxy_override {
+                        cred_req.proxy_url = Some(proxy_url);
+                    }
+                    if let Some(rpm_limit) = rpm_override {
+                        cred_req.rpm_limit = rpm_limit;
+                    }
                     let result = service.import_one_credential(cred_req, verify).await;
                     (index, result)
                 }

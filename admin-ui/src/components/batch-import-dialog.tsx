@@ -24,6 +24,7 @@ import {
   completeExternalIdpImportFields,
   deriveEmailFromAccessToken,
   extractErrorMessage,
+  maskProxyUrl,
   normalizeImportAuthMethod,
   sha256Hex,
 } from '@/lib/utils'
@@ -237,6 +238,20 @@ function isErrorStatus(status: string | undefined): boolean {
   return status?.trim().toLowerCase() === 'error'
 }
 
+function parseUniformRpmLimit(raw: string): number | undefined {
+  const value = raw.trim()
+  if (!value) return undefined
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error('统一 RPM 必须是大于等于 0 的整数')
+  }
+  return parsed
+}
+
+function maskProxyCandidate(candidate: string): string {
+  return candidate.toLowerCase() === 'direct' ? 'direct' : maskProxyUrl(candidate)
+}
+
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
@@ -246,6 +261,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [results, setResults] = useState<VerificationResult[]>([])
   // 导入时统一为所有账号设置的分组（与 JSON 内 groups 取并集）。
   const [groups, setGroups] = useState<string[]>([])
+  // 统一覆盖导入账号的代理与 RPM；留空表示保留 JSON/现有自动分配逻辑。
+  const [uniformProxyUrl, setUniformProxyUrl] = useState('')
+  const [uniformRpmLimit, setUniformRpmLimit] = useState('')
   const groupOptions = useGroupOptions()
   const fileInputRef = useRef<HTMLInputElement>(null)
   // 进行中的 AbortController，用于"停止导入"：abort 会让 fetch 流中断，
@@ -267,6 +285,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setCurrentProcessing('')
     setResults([])
     setGroups([])
+    setUniformProxyUrl('')
+    setUniformRpmLimit('')
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -333,6 +353,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       return
     }
 
+    const proxyOverride = uniformProxyUrl.trim() || undefined
+    let rpmOverride: number | undefined
+    try {
+      rpmOverride = parseUniformRpmLimit(uniformRpmLimit)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
+
     try {
       setImporting(true)
       setProgress({ current: 0, total: credentials.length })
@@ -372,11 +401,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           continue
         }
 
-        // 若凭据未指定代理且代理池有可用代理，随机分配一个
-        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
+        // 统一代理优先级最高；否则沿用 JSON 内单条代理；都没有时保持现有随机分配代理池逻辑。
+        if (proxyOverride) {
+          cred.proxyUrl = proxyOverride
+        } else if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
           const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
           cred.proxyUrl = picked.url
         }
+        const rpmLimit = rpmOverride ?? cred.rpmLimit ?? 0
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -404,8 +436,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authMethod: 'api_key',
               kiroApiKey: apiKey,
               priority: cred.priority || 0,
-              // 导入默认不限速（0）；JSON 显式带 rpmLimit 时尊重原值
-              rpmLimit: cred.rpmLimit ?? 0,
+              rpmLimit,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
@@ -484,8 +515,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               issuerUrl: isExternalIdp ? issuerUrl : undefined,
               scopes: isExternalIdp ? scopes : undefined,
               priority: cred.priority || 0,
-              // 导入默认不限速（0）；JSON 显式带 rpmLimit 时尊重原值
-              rpmLimit: cred.rpmLimit ?? 0,
+              rpmLimit,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
@@ -514,7 +544,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         const controller = new AbortController()
         abortRef.current = controller
         await batchImportCredentials(
-          { credentials: toImport.map(t => t.req), concurrency: 8, verify },
+          {
+            credentials: toImport.map(t => t.req),
+            proxyUrl: proxyOverride,
+            rpmLimit: rpmOverride,
+            concurrency: 8,
+            verify,
+          },
           (ev: BatchImportItemEvent) => {
             const orig = toImport[ev.index]?.index ?? -1
             if (orig < 0) return
@@ -652,6 +688,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }, [jsonInput])
   const errorAccountCount = previewCredentials.filter((cred) => isErrorStatus(cred.status)).length
+  const enabledProxyOptions = proxyPool?.proxies.filter((proxy) => proxy.enabled) ?? []
 
   return (
     <Dialog
@@ -735,6 +772,61 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             </div>
           )}
 
+          <div className="space-y-3 rounded-md border bg-muted/30 p-3">
+            <div className="text-sm font-medium">统一导入设置（可选）</div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm text-muted-foreground">统一代理</label>
+                <div className="grid gap-2">
+                  <input
+                    type="text"
+                    value={uniformProxyUrl}
+                    onChange={(e) => setUniformProxyUrl(e.target.value)}
+                    disabled={importing}
+                    placeholder="不填则保留 JSON/自动分配；direct 为直连"
+                    className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                  <select
+                    value=""
+                    onChange={(e) => {
+                      if (!e.target.value) return
+                      setUniformProxyUrl(e.target.value)
+                    }}
+                    disabled={importing}
+                    className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm"
+                  >
+                    <option value="">从代理池选择...</option>
+                    <option value="direct">direct（直连）</option>
+                    {enabledProxyOptions.map((proxy) => (
+                      <option key={proxy.id} value={proxy.url}>
+                        {proxy.label ? `${proxy.label} | ` : ''}{maskProxyCandidate(proxy.url)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  填写后会覆盖所有导入账号的代理；留空则保留账号自带代理，没有代理字段时继续随机分配代理池。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-muted-foreground">统一 RPM</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={uniformRpmLimit}
+                  onChange={(e) => setUniformRpmLimit(e.target.value)}
+                  disabled={importing}
+                  placeholder="不填则尊重 JSON；0 表示不限速"
+                  className="h-9 w-full rounded-lg border border-input bg-background px-3 text-sm font-mono placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <p className="text-xs text-muted-foreground">
+                  填写后会覆盖所有导入账号的 rpmLimit；留空时 JSON 内有值就使用该值，否则默认 0。
+                </p>
+              </div>
+            </div>
+          </div>
+
           {/* 导入分组：选中的分组会统一应用到本次导入的所有账号
               （与 JSON 内自带的 groups 取并集），免去导入后逐个改分组。 */}
           <div className="space-y-2">
@@ -746,7 +838,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               disabled={importing}
             />
             <p className="text-xs text-muted-foreground">
-              为本次导入的所有账号统一指定分组。RPM 上限默认不限速（0），可在导入后单独调整。
+              为本次导入的所有账号统一指定分组，会和 JSON 内自带的 groups 合并去重。
             </p>
           </div>
 
