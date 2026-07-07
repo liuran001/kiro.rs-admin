@@ -25,9 +25,10 @@ use super::{
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
         ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -599,6 +600,27 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/retry-policy
+/// 获取普通 429 重试策略
+pub async fn get_retry_policy(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_retry_policy() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/retry-policy
+/// 更新普通 429 重试策略
+pub async fn set_retry_policy(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRetryPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_retry_policy(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

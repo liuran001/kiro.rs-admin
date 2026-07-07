@@ -260,9 +260,15 @@ export function CredentialCard({
   const [throttleRemaining, setThrottleRemaining] = useState<number>(
     credential.throttledRemainingSecs ?? 0,
   );
+  const [rateLimitRemainingMs, setRateLimitRemainingMs] = useState<number>(
+    credential.rateLimitedRemainingMs ?? 0,
+  );
   useEffect(() => {
     setThrottleRemaining(credential.throttledRemainingSecs ?? 0);
   }, [credential.throttledRemainingSecs]);
+  useEffect(() => {
+    setRateLimitRemainingMs(credential.rateLimitedRemainingMs ?? 0);
+  }, [credential.rateLimitedRemainingMs]);
   useEffect(() => {
     if (throttleRemaining <= 0) return;
     const t = window.setInterval(() => {
@@ -270,10 +276,18 @@ export function CredentialCard({
     }, 1000);
     return () => window.clearInterval(t);
   }, [throttleRemaining]);
+  useEffect(() => {
+    if (rateLimitRemainingMs <= 0) return;
+    const t = window.setInterval(() => {
+      setRateLimitRemainingMs((v) => (v > 0 ? Math.max(0, v - 1000) : 0));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [rateLimitRemainingMs]);
   const handleClearThrottle = useCallback(() => {
     clearThrottle.mutate(credential.id, {
       onSuccess: (res) => {
         setThrottleRemaining(0);
+        setRateLimitRemainingMs(0);
         toast.success(res.message);
       },
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
@@ -387,6 +401,7 @@ export function CredentialCard({
     credential.disabled && credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
+  const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
 
   // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
   const stateClasses = [
@@ -397,6 +412,9 @@ export function CredentialCard({
       : "",
     isThrottled
       ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
+      : "",
+    isRateLimited && !isThrottled
+      ? "ring-1 ring-sky-500/50 bg-sky-50/40 dark:bg-sky-500/[0.04]"
       : "",
     credential.disabled && !disabledByQuota ? "opacity-70" : "",
   ]
@@ -432,6 +450,16 @@ export function CredentialCard({
         >
           <Clock className="mr-1 h-3 w-3" />
           冷却 {formatThrottleCountdown(throttleRemaining)}
+        </Badge>
+      )}
+      {isRateLimited && (
+        <Badge
+          variant="outline"
+          className="border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+          title="普通 429 策略冷却中，到期或手动解除后恢复调度"
+        >
+          <Clock className="mr-1 h-3 w-3" />
+          429 冷却 {formatThrottleCountdown(Math.ceil(rateLimitRemainingMs / 1000))}
         </Badge>
       )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
@@ -506,7 +534,7 @@ export function CredentialCard({
           <MessageCircle />
           测试响应
         </DropdownMenuItem>
-        {throttleRemaining > 0 && (
+        {(throttleRemaining > 0 || rateLimitRemainingMs > 0) && (
           <DropdownMenuItem
             onSelect={(e) => {
               e.preventDefault();
@@ -515,7 +543,7 @@ export function CredentialCard({
             disabled={clearThrottle.isPending}
           >
             <Clock />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+            解除临时冷却
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&

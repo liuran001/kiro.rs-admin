@@ -19,7 +19,7 @@ use crate::kiro::model::credentials::{
 };
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::Config;
+use crate::model::config::{Config, RetryMode};
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
@@ -32,11 +32,11 @@ use super::types::{
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
-    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    UpdateRefreshTokenRequest,
+    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
+    UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -625,6 +625,7 @@ impl AdminService {
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     throttled_remaining_secs: entry.throttled_remaining_secs,
+                    rate_limited_remaining_ms: entry.rate_limited_remaining_ms,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
@@ -2024,6 +2025,35 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取普通 429 重试策略
+    pub fn get_retry_policy(&self) -> Result<RetryPolicyResponse, AdminServiceError> {
+        let (mode, custom_policy, effective_policy) = self
+            .token_manager
+            .get_retry_policy()
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(RetryPolicyResponse {
+            mode: mode.to_string(),
+            custom_policy,
+            effective_policy,
+        })
+    }
+
+    /// 更新普通 429 重试策略
+    pub fn set_retry_policy(
+        &self,
+        req: SetRetryPolicyRequest,
+    ) -> Result<RetryPolicyResponse, AdminServiceError> {
+        let mode = req.mode.parse::<RetryMode>().map_err(|e| {
+            AdminServiceError::InvalidCredential(format!("无效的 429 重试策略: {}", e))
+        })?;
+        self.token_manager
+            .set_retry_policy(mode, req.custom_policy.clone())
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        self.get_retry_policy()
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

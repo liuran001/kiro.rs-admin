@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,9 +19,13 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useRetryPolicy, useSetRetryPolicy,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey, type LoadBalancingMode, LB_LABEL, nextLbMode } from '@/api/credentials'
+import {
+  updateAdminKey, type LoadBalancingMode, LB_LABEL, nextLbMode,
+  type RetryMode, type RetryPolicy, type RetryPolicyConfig,
+} from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 
@@ -41,6 +45,8 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
   const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
+  const { data: retryPolicy, isLoading: isLoadingRetry } = useRetryPolicy()
+  const { mutate: setRetryPolicy, isPending: isSettingRetry } = useSetRetryPolicy()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
@@ -106,12 +112,23 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     handleToggleFailover,
     handleToggleLoadBalancing,
     isLoadingMode,
+    isLoadingRetry,
     isLoadingThrottle,
     isSettingMode,
+    isSettingRetry,
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openKeyDialog,
+    retryPolicy,
+    setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) =>
+      setRetryPolicy(
+        { mode, customPolicy: mode === 'custom' ? customPolicy ?? DEFAULT_CUSTOM_RETRY_POLICY : null },
+        {
+          onSuccess: (res) => toast.success(`429 策略已切换到 ${RETRY_MODE_LABELS[res.mode]}`),
+          onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+        },
+      ),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -226,12 +243,16 @@ interface ToolControls {
   handleToggleFailover: () => void
   handleToggleLoadBalancing: () => void
   isLoadingMode: boolean
+  isLoadingRetry: boolean
   isLoadingThrottle: boolean
   isSettingMode: boolean
+  isSettingRetry: boolean
   isSettingThrottle: boolean
   loadBalancingMode?: LoadBalancingMode
   openImageUpdate: () => void
   openKeyDialog: () => void
+  retryPolicy?: RetryPolicyConfig
+  setRetryPolicy: (mode: RetryMode, customPolicy?: RetryPolicy | null) => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -241,6 +262,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
   return (
     <>
       <LoadBalancingButton controls={controls} />
+      <RetryPolicyButton controls={controls} />
       <ThrottleConfigButton
         config={controls.throttleConfig}
         loading={controls.isLoadingThrottle}
@@ -288,6 +310,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
+        <RetryCompactItems controls={controls} />
         <ThrottleCompactItems {...throttleProps} />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -315,6 +338,281 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
       </span>
     </Button>
   )
+}
+
+const RETRY_MODES: RetryMode[] = [
+  'failover',
+  'turbo',
+  'fast',
+  'balanced',
+  'steady',
+  'polite',
+  'custom',
+]
+
+const RETRY_MODE_LABELS: Record<RetryMode, string> = {
+  failover: '默认故障转移',
+  turbo: 'Turbo',
+  fast: 'Fast',
+  balanced: 'Balanced',
+  steady: 'Steady',
+  polite: 'Polite',
+  custom: 'Custom',
+}
+
+const RETRY_MODE_DESCRIPTIONS: Record<RetryMode, string> = {
+  failover: '当前默认：普通 429 先在本次请求内切换其它凭据，保留端点备用桶；不做跨请求冷却，适合多账号池保持吞吐。',
+  turbo: '最激进：1 秒短冷却、最多 12 次/凭据重试，恢复最快，但更容易持续压到上游限流。',
+  fast: '快速恢复：3 秒冷却、9 次/凭据重试，适合短时高峰，仍会快速换凭据。',
+  balanced: '折中策略：10 秒冷却、9 次/凭据重试，在吞吐和稳定之间取平衡。',
+  steady: '稳态策略：30 秒冷却、6 次/凭据重试，并尊重 Retry-After，减少重复撞同一个限流桶。',
+  polite: '保守策略：60 秒冷却、4 次/凭据重试，尊重 Retry-After，不主动换凭据。',
+  custom: '自定义：手动设置普通 429 冷却、每凭据重试次数、退避范围、是否换凭据和是否尊重 Retry-After。',
+}
+
+const DEFAULT_CUSTOM_RETRY_POLICY: RetryPolicy = {
+  rateLimitCooldownMs: 3000,
+  maxRequestRetries: 9,
+  baseBackoffMs: 200,
+  maxBackoffMs: 2000,
+  credentialSwitchOn429: true,
+  respectRetryAfter: false,
+}
+
+function RetryPolicyButton({ controls }: { controls: ToolControls }) {
+  const [open, setOpen] = useState(false)
+  const [customPolicy, setCustomPolicy] = useState<RetryPolicy>(DEFAULT_CUSTOM_RETRY_POLICY)
+  const activeMode = controls.retryPolicy?.mode ?? 'failover'
+  const effective = controls.retryPolicy?.effectivePolicy
+
+  useEffect(() => {
+    if (controls.retryPolicy?.customPolicy) {
+      setCustomPolicy(controls.retryPolicy.customPolicy)
+    } else if (controls.retryPolicy?.mode === 'custom' && controls.retryPolicy.effectivePolicy) {
+      setCustomPolicy(controls.retryPolicy.effectivePolicy)
+    }
+  }, [controls.retryPolicy?.customPolicy, controls.retryPolicy?.effectivePolicy, controls.retryPolicy?.mode])
+
+  const updateNumber = (key: keyof RetryPolicy, value: string) => {
+    const numeric = Number(value)
+    setCustomPolicy((prev) => ({
+      ...prev,
+      [key]: Number.isFinite(numeric) ? numeric : 0,
+    }))
+  }
+
+  const applyMode = (mode: RetryMode, custom = customPolicy) => {
+    controls.setRetryPolicy(mode, mode === 'custom' ? custom : null)
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={controls.isLoadingRetry || controls.isSettingRetry}
+          title={retryPolicyTitle(controls.isLoadingRetry, activeMode, effective)}
+        >
+          <Gauge className="h-3.5 w-3.5" />
+          <span className="hidden md:inline">
+            {controls.isLoadingRetry ? '429…' : RETRY_MODE_LABELS[activeMode]}
+          </span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-[28rem] max-w-[calc(100vw-2rem)]">
+        <DropdownMenuLabel>普通 429 重试策略</DropdownMenuLabel>
+        <div className="space-y-3 px-2 pb-2">
+          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+            {RETRY_MODES.map((mode) => (
+              <Button
+                key={mode}
+                type="button"
+                size="sm"
+                variant={activeMode === mode ? 'default' : 'outline'}
+                className="h-auto min-h-8 justify-start px-2 py-1.5 text-xs"
+                disabled={controls.isLoadingRetry || controls.isSettingRetry}
+                title={RETRY_MODE_DESCRIPTIONS[mode]}
+                onClick={() => applyMode(mode)}
+              >
+                {RETRY_MODE_LABELS[mode]}
+              </Button>
+            ))}
+          </div>
+          <div className="rounded-md bg-secondary/40 px-2.5 py-2 text-xs">
+            <div className="font-medium text-foreground">
+              {RETRY_MODE_LABELS[activeMode]}
+            </div>
+            <p className="mt-1 leading-snug text-muted-foreground">
+              {RETRY_MODE_DESCRIPTIONS[activeMode]}
+            </p>
+            {effective && (
+              <div className="mt-2 text-muted-foreground">
+                {retryPolicySummary(effective)}
+              </div>
+            )}
+          </div>
+          {activeMode === 'custom' && (
+            <CustomRetryPolicyForm
+              policy={customPolicy}
+              saving={controls.isSettingRetry}
+              onApply={() => applyMode('custom', customPolicy)}
+              onBoolChange={(key, checked) =>
+                setCustomPolicy((prev) => ({ ...prev, [key]: checked }))
+              }
+              onNumberChange={updateNumber}
+            />
+          )}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function CustomRetryPolicyForm({
+  policy, saving, onApply, onBoolChange, onNumberChange,
+}: {
+  policy: RetryPolicy
+  saving: boolean
+  onApply: () => void
+  onBoolChange: (key: 'credentialSwitchOn429' | 'respectRetryAfter', checked: boolean) => void
+  onNumberChange: (key: keyof RetryPolicy, value: string) => void
+}) {
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      <RetryNumberInput
+        label="冷却 ms"
+        min={0}
+        max={120000}
+        value={policy.rateLimitCooldownMs}
+        onChange={(value) => onNumberChange('rateLimitCooldownMs', value)}
+      />
+      <RetryNumberInput
+        label="每凭据重试"
+        min={1}
+        max={30}
+        value={policy.maxRequestRetries}
+        onChange={(value) => onNumberChange('maxRequestRetries', value)}
+      />
+      <RetryNumberInput
+        label="基础退避 ms"
+        min={50}
+        max={30000}
+        value={policy.baseBackoffMs}
+        onChange={(value) => onNumberChange('baseBackoffMs', value)}
+      />
+      <RetryNumberInput
+        label="最大退避 ms"
+        min={policy.baseBackoffMs}
+        max={120000}
+        value={policy.maxBackoffMs}
+        onChange={(value) => onNumberChange('maxBackoffMs', value)}
+      />
+      <RetrySwitch
+        checked={policy.credentialSwitchOn429}
+        label="429 换凭据"
+        onCheckedChange={(checked) => onBoolChange('credentialSwitchOn429', checked)}
+      />
+      <RetrySwitch
+        checked={policy.respectRetryAfter}
+        label="Retry-After"
+        onCheckedChange={(checked) => onBoolChange('respectRetryAfter', checked)}
+      />
+      <Button
+        type="button"
+        size="sm"
+        className="sm:col-span-2"
+        disabled={saving}
+        onClick={onApply}
+      >
+        保存 Custom
+      </Button>
+    </div>
+  )
+}
+
+function RetryNumberInput({
+  label, min, max, value, onChange,
+}: {
+  label: string
+  min: number
+  max: number
+  value: number
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className="text-xs font-medium text-muted-foreground">
+      {label}
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-1 h-8 text-xs"
+      />
+    </label>
+  )
+}
+
+function RetrySwitch({
+  checked, label, onCheckedChange,
+}: {
+  checked: boolean
+  label: string
+  onCheckedChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex min-h-8 items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2 text-xs font-medium text-muted-foreground">
+      {label}
+      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+    </label>
+  )
+}
+
+function RetryCompactItems({ controls }: { controls: ToolControls }) {
+  const activeMode = controls.retryPolicy?.mode ?? 'failover'
+  const busy = controls.isLoadingRetry || controls.isSettingRetry
+
+  return (
+    <>
+      <DropdownMenuLabel>普通 429 策略</DropdownMenuLabel>
+      <div className="grid grid-cols-2 gap-1 px-2 pb-2">
+        {RETRY_MODES.filter((mode) => mode !== 'custom').map((mode) => (
+          <Button
+            key={mode}
+            type="button"
+            size="sm"
+            variant={activeMode === mode ? 'default' : 'outline'}
+            className="h-7 justify-start text-xs"
+            disabled={busy}
+            title={RETRY_MODE_DESCRIPTIONS[mode]}
+            onClick={() => controls.setRetryPolicy(mode, null)}
+          >
+            {RETRY_MODE_LABELS[mode]}
+          </Button>
+        ))}
+      </div>
+      <div className="px-2 pb-2 text-[11px] leading-snug text-muted-foreground">
+        {RETRY_MODE_DESCRIPTIONS[activeMode]}
+      </div>
+    </>
+  )
+}
+
+function retryPolicyTitle(loading: boolean, mode: RetryMode, policy?: RetryPolicy) {
+  if (loading) return '429 策略加载中…'
+  if (!policy) return `普通 429 策略：${RETRY_MODE_LABELS[mode]}`
+  return `普通 429 策略：${RETRY_MODE_LABELS[mode]}（${retryPolicySummary(policy)}）`
+}
+
+function retryPolicySummary(policy: RetryPolicy) {
+  const cooldown = policy.rateLimitCooldownMs <= 0
+    ? '不跨请求冷却'
+    : `冷却 ${(policy.rateLimitCooldownMs / 1000).toFixed(1)}s`
+  const switchText = policy.credentialSwitchOn429 ? '429 换凭据' : '不主动换凭据'
+  const retryAfter = policy.respectRetryAfter ? '尊重 Retry-After' : '忽略 Retry-After'
+  return `${cooldown} · 每凭据 ${policy.maxRequestRetries} 次 · ${switchText} · ${retryAfter}`
 }
 
 function RefreshButton({ onRefresh }: { onRefresh: () => void }) {

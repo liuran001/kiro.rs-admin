@@ -485,6 +485,36 @@ export async function setProxyBalancingMode(
   return data
 }
 
+// 普通 429 重试策略
+export type RetryMode = 'failover' | 'turbo' | 'fast' | 'balanced' | 'steady' | 'polite' | 'custom'
+
+export interface RetryPolicy {
+  rateLimitCooldownMs: number
+  maxRequestRetries: number
+  baseBackoffMs: number
+  maxBackoffMs: number
+  credentialSwitchOn429: boolean
+  respectRetryAfter: boolean
+}
+
+export interface RetryPolicyConfig {
+  mode: RetryMode
+  customPolicy?: RetryPolicy | null
+  effectivePolicy: RetryPolicy
+}
+
+export async function getRetryPolicy(): Promise<RetryPolicyConfig> {
+  const { data } = await api.get<RetryPolicyConfig>('/config/retry-policy')
+  return data
+}
+
+export async function setRetryPolicy(
+  req: Pick<RetryPolicyConfig, 'mode'> & { customPolicy?: RetryPolicy | null },
+): Promise<RetryPolicyConfig> {
+  const { data } = await api.put<RetryPolicyConfig>('/config/retry-policy', req)
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number

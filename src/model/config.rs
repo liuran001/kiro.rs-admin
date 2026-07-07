@@ -30,6 +30,159 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// 普通 429 的重试策略模式。
+///
+/// `Failover` 是本项目默认策略：保留当前行为，普通 429 在本次请求内优先换桶/换凭据，
+/// 不给凭据施加跨请求冷却。其它模式来自 Kiro-RS-Tool，用于按需切换为更激进或更保守的
+/// 普通 429 冷却与重试节奏。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RetryMode {
+    #[default]
+    Failover,
+    Turbo,
+    Fast,
+    Balanced,
+    Steady,
+    Polite,
+    Custom,
+}
+
+impl std::fmt::Display for RetryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Failover => "failover",
+            Self::Turbo => "turbo",
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Steady => "steady",
+            Self::Polite => "polite",
+            Self::Custom => "custom",
+        };
+        f.write_str(value)
+    }
+}
+
+impl std::str::FromStr for RetryMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "failover" | "current" | "default" => Ok(Self::Failover),
+            "turbo" => Ok(Self::Turbo),
+            "fast" => Ok(Self::Fast),
+            "balanced" => Ok(Self::Balanced),
+            "steady" => Ok(Self::Steady),
+            "polite" => Ok(Self::Polite),
+            "custom" => Ok(Self::Custom),
+            _ => anyhow::bail!("无效的重试模式: {}", value),
+        }
+    }
+}
+
+/// 普通 429 的可配置重试策略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicy {
+    /// 普通 429 后的跨请求冷却时间；0 表示不进入跨请求冷却。
+    pub rate_limit_cooldown_ms: u64,
+    /// 每个凭据的请求重试预算。非默认策略会按账号数放大，并受全局上限保护。
+    pub max_request_retries: usize,
+    /// 指数退避基础时长。
+    pub base_backoff_ms: u64,
+    /// 指数退避最大时长。
+    pub max_backoff_ms: u64,
+    /// 普通 429 后是否优先切换其它凭据。
+    pub credential_switch_on_429: bool,
+    /// 是否尊重上游 Retry-After 头。
+    pub respect_retry_after: bool,
+}
+
+impl RetryPolicy {
+    pub fn preset(mode: RetryMode) -> Self {
+        match mode {
+            RetryMode::Failover => Self {
+                rate_limit_cooldown_ms: 0,
+                max_request_retries: 3,
+                base_backoff_ms: 1_000,
+                max_backoff_ms: 8_000,
+                credential_switch_on_429: true,
+                respect_retry_after: false,
+            },
+            RetryMode::Turbo => Self {
+                rate_limit_cooldown_ms: 1_000,
+                max_request_retries: 12,
+                base_backoff_ms: 100,
+                max_backoff_ms: 1_000,
+                credential_switch_on_429: true,
+                respect_retry_after: false,
+            },
+            RetryMode::Fast => Self {
+                rate_limit_cooldown_ms: 3_000,
+                max_request_retries: 9,
+                base_backoff_ms: 200,
+                max_backoff_ms: 2_000,
+                credential_switch_on_429: true,
+                respect_retry_after: false,
+            },
+            RetryMode::Balanced => Self {
+                rate_limit_cooldown_ms: 10_000,
+                max_request_retries: 9,
+                base_backoff_ms: 500,
+                max_backoff_ms: 5_000,
+                credential_switch_on_429: true,
+                respect_retry_after: false,
+            },
+            RetryMode::Steady => Self {
+                rate_limit_cooldown_ms: 30_000,
+                max_request_retries: 6,
+                base_backoff_ms: 1_000,
+                max_backoff_ms: 10_000,
+                credential_switch_on_429: true,
+                respect_retry_after: true,
+            },
+            RetryMode::Polite => Self {
+                rate_limit_cooldown_ms: 60_000,
+                max_request_retries: 4,
+                base_backoff_ms: 2_000,
+                max_backoff_ms: 30_000,
+                credential_switch_on_429: false,
+                respect_retry_after: true,
+            },
+            RetryMode::Custom => Self::preset(RetryMode::Fast),
+        }
+    }
+
+    pub fn effective(mode: RetryMode, custom: Option<&RetryPolicy>) -> anyhow::Result<Self> {
+        let policy = if mode == RetryMode::Custom {
+            custom
+                .cloned()
+                .unwrap_or_else(|| Self::preset(RetryMode::Fast))
+        } else {
+            Self::preset(mode)
+        };
+
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.rate_limit_cooldown_ms > 120_000 {
+            anyhow::bail!("rateLimitCooldownMs 必须在 0..=120000 之间");
+        }
+        if !(1..=30).contains(&self.max_request_retries) {
+            anyhow::bail!("maxRequestRetries 必须在 1..=30 之间");
+        }
+        if !(50..=30_000).contains(&self.base_backoff_ms) {
+            anyhow::bail!("baseBackoffMs 必须在 50..=30000 之间");
+        }
+        if self.max_backoff_ms < self.base_backoff_ms || self.max_backoff_ms > 120_000 {
+            anyhow::bail!("maxBackoffMs 必须在 baseBackoffMs..=120000 之间");
+        }
+        Ok(())
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,6 +298,15 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 普通 429 重试策略模式。默认 `failover` 保持当前项目行为。
+    #[serde(default = "default_retry_mode")]
+    pub retry_mode: RetryMode,
+
+    /// `retry_mode = custom` 时使用的普通 429 自定义策略。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -236,6 +398,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_retry_mode() -> RetryMode {
+    RetryMode::Failover
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -294,6 +460,8 @@ impl Default for Config {
             proxy_balancing_mode: default_proxy_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            retry_mode: default_retry_mode(),
+            retry_policy: None,
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),

@@ -16,6 +16,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getRetryPolicy,
+  setRetryPolicy,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -211,6 +213,26 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取普通 429 重试策略
+export function useRetryPolicy() {
+  return useQuery({
+    queryKey: ['retryPolicy'],
+    queryFn: getRetryPolicy,
+  })
+}
+
+// 更新普通 429 重试策略
+export function useSetRetryPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRetryPolicy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['retryPolicy'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

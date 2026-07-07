@@ -1,6 +1,7 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
+use crate::model::config::RetryPolicy;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -73,6 +74,9 @@ pub struct CredentialStatusItem {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 普通 429 策略冷却剩余毫秒数；冷却中且 `> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_remaining_ms: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）
@@ -536,6 +540,30 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 普通 429 重试策略响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicyResponse {
+    /// 当前模式（"failover" / "turbo" / "fast" / "balanced" / "steady" / "polite" / "custom"）
+    pub mode: String,
+    /// 自定义策略，仅 custom 模式使用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_policy: Option<RetryPolicy>,
+    /// 当前实际生效策略
+    pub effective_policy: RetryPolicy,
+}
+
+/// 更新普通 429 重试策略
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRetryPolicyRequest {
+    /// 目标模式
+    pub mode: String,
+    /// custom 模式的策略；非 custom 可传 null/省略
+    #[serde(default)]
+    pub custom_policy: Option<RetryPolicy>,
 }
 
 /// 日志治理配置响应

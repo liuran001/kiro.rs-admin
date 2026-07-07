@@ -1061,6 +1061,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "httpdate",
  "image",
  "mime_guess",
  "parking_lot",

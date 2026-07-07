@@ -27,7 +27,7 @@ use crate::kiro::model::token_refresh::{
     RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, RetryMode, RetryPolicy};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -869,6 +869,9 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 普通 429 策略冷却到期时间。
+    /// 仅在非默认普通 429 策略启用跨请求冷却时设置，不表示账号级风控或永久失败。
+    rate_limited_until: Option<Instant>,
     /// 运行中（in-flight）请求计数。least_conn 负载均衡用。
     /// 凭据交给调用方时 +1，请求结束时 -1（由 InFlightGuard 负责）。
     /// 不持久化，进程重启归零（与 throttled_until 同类，纯运行时状态）。
@@ -959,6 +962,9 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却剩余秒数（账号级 429 风控）；冷却中且 `> 0` 才返回
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_remaining_secs: Option<u64>,
+    /// 普通 429 策略冷却剩余毫秒数；冷却中且 `> 0` 才返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_remaining_ms: Option<u64>,
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
@@ -1016,6 +1022,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 普通 429 重试策略模式（运行时可修改）
+    retry_mode: Mutex<RetryMode>,
+    /// 普通 429 自定义策略（运行时可修改）
+    retry_policy: Mutex<Option<RetryPolicy>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1115,6 +1125,13 @@ fn is_rpm_exceeded(entry: &CredentialEntry, now: Instant) -> bool {
     rpm_window_count(entry, now) >= limit
 }
 
+fn cooldown_remaining_ms(until: Option<Instant>, now: Instant) -> Option<u64> {
+    until
+        .and_then(|t| t.checked_duration_since(now))
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .filter(|ms| *ms > 0)
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -1172,6 +1189,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    rate_limited_until: None,
                     in_flight: 0,
                     recent_requests: VecDeque::new(),
                 }
@@ -1222,6 +1240,8 @@ impl MultiTokenManager {
         let proxy_balancing_mode = config.proxy_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let retry_mode = config.retry_mode;
+        let retry_policy = config.retry_policy.clone();
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1236,6 +1256,8 @@ impl MultiTokenManager {
             proxy_balancing_mode: Mutex::new(proxy_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            retry_mode: Mutex::new(retry_mode),
+            retry_policy: Mutex::new(retry_policy),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1308,7 +1330,11 @@ impl MultiTokenManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+            })
             .count()
     }
 
@@ -1320,6 +1346,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg_attr(not(test), allow(dead_code))]
     fn select_next_credential(
         &self,
         model: Option<&str>,
@@ -1349,6 +1376,10 @@ impl MultiTokenManager {
                 }
                 // 临时冷却中（账号级 429 风控）：跳过
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+                    return false;
+                }
+                // 普通 429 策略冷却中：跳过
+                if e.rate_limited_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
                 // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
@@ -1409,6 +1440,7 @@ impl MultiTokenManager {
             !excluded_ids.contains(&e.id)
                 && !e.disabled
                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                 && credential_matches_request(&e.credentials, model, group)
                 && !is_rpm_exceeded(e, now)
         })
@@ -1471,6 +1503,7 @@ impl MultiTokenManager {
                                 && !excluded_ids.contains(&e.id)
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
                                 && !is_rpm_exceeded(e, now)
                                 && credential_matches_request(&e.credentials, model, group)
                         })
@@ -2030,6 +2063,7 @@ impl MultiTokenManager {
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
+                entry.rate_limited_until = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -2321,7 +2355,11 @@ impl MultiTokenManager {
         let now = Instant::now();
         let available = entries
             .iter()
-            .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+            })
             .count();
 
         ManagerSnapshot {
@@ -2395,6 +2433,7 @@ impl MultiTokenManager {
                         .and_then(|t| t.checked_duration_since(now))
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
+                    rate_limited_remaining_ms: cooldown_remaining_ms(e.rate_limited_until, now),
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
@@ -2421,6 +2460,7 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
+                entry.rate_limited_until = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -2465,9 +2505,61 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
+                        && !e
+                            .rate_limited_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
+    }
+
+    /// 标记凭据进入普通 429 策略冷却期。
+    ///
+    /// 普通 429 不表示凭据永久失败，因此不增加连续失败计数、不禁用凭据；
+    /// 如果策略要求换凭据，调度会跳过处于此冷却状态的账号。
+    ///
+    /// 返回除当前凭据外是否仍有其它可用凭据。
+    pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> bool {
+        let now = Instant::now();
+        let until = now + cooldown;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if cooldown > StdDuration::ZERO {
+                entry.rate_limited_until = Some(match entry.rate_limited_until {
+                    Some(prev) if prev > until => prev,
+                    _ => until,
+                });
+            }
+            entry.total_failure_count += 1;
+            tracing::warn!(
+                "凭据 #{} 命中普通 429，策略冷却 {}ms",
+                id,
+                cooldown.as_millis()
+            );
+        }
+
+        let current_id = *self.current_id.lock();
+        if current_id == id
+            && let Some(next) = entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && e.id != id
+                        && cooldown_remaining_ms(e.throttled_until, now).is_none()
+                        && cooldown_remaining_ms(e.rate_limited_until, now).is_none()
+                })
+                .min_by_key(|e| e.credentials.priority)
+        {
+            *self.current_id.lock() = next.id;
+        }
+
+        entries.iter().any(|e| {
+            !e.disabled
+                && e.id != id
+                && cooldown_remaining_ms(e.throttled_until, now).is_none()
+                && cooldown_remaining_ms(e.rate_limited_until, now).is_none()
+        })
     }
 
     /// 手动解除指定凭据的临时冷却（Admin API）
@@ -2480,7 +2572,8 @@ impl MultiTokenManager {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
-        tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
+        entry.rate_limited_until = None;
+        tracing::info!("凭据 #{} 临时冷却已被手动解除", id);
         Ok(())
     }
 
@@ -2538,6 +2631,7 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             entry.throttled_until = None;
+            entry.rate_limited_until = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -3147,6 +3241,7 @@ impl MultiTokenManager {
                 success_count: baseline_success,
                 last_used_at: None,
                 throttled_until: None,
+                rate_limited_until: None,
                 in_flight: 0,
                 recent_requests: VecDeque::new(),
             });
@@ -3543,6 +3638,76 @@ impl MultiTokenManager {
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
         self.load_balancing_mode.lock().clone()
+    }
+
+    /// 获取普通 429 重试策略（Admin API / Provider）。
+    pub fn get_retry_policy(
+        &self,
+    ) -> anyhow::Result<(RetryMode, Option<RetryPolicy>, RetryPolicy)> {
+        let mode = *self.retry_mode.lock();
+        let custom = self.retry_policy.lock().clone();
+        let effective = RetryPolicy::effective(mode, custom.as_ref())?;
+        Ok((mode, custom, effective))
+    }
+
+    /// 设置普通 429 重试策略（Admin API）。
+    pub fn set_retry_policy(
+        &self,
+        mode: RetryMode,
+        custom: Option<RetryPolicy>,
+    ) -> anyhow::Result<()> {
+        RetryPolicy::effective(mode, custom.as_ref())?;
+
+        let previous_mode = *self.retry_mode.lock();
+        let previous_custom = self.retry_policy.lock().clone();
+        if previous_mode == mode && previous_custom == custom {
+            return Ok(());
+        }
+
+        *self.retry_mode.lock() = mode;
+        *self.retry_policy.lock() = custom.clone();
+
+        if mode == RetryMode::Failover {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                entry.rate_limited_until = None;
+            }
+        }
+
+        if let Err(err) = self.persist_retry_policy(mode, custom.as_ref()) {
+            *self.retry_mode.lock() = previous_mode;
+            *self.retry_policy.lock() = previous_custom;
+            return Err(err);
+        }
+
+        tracing::info!("普通 429 重试策略已设置为: {}", mode);
+        Ok(())
+    }
+
+    fn persist_retry_policy(
+        &self,
+        mode: RetryMode,
+        custom: Option<&RetryPolicy>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，普通 429 重试策略仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.retry_mode = mode;
+        config.retry_policy = custom.cloned();
+        config
+            .save()
+            .with_context(|| format!("持久化普通 429 重试策略失败: {}", config_path.display()))?;
+
+        Ok(())
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
@@ -5104,6 +5269,100 @@ mod tests {
         // 原子落盘后不应残留临时文件
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_retry_policy_presets_and_validation() {
+        let failover = RetryPolicy::preset(RetryMode::Failover);
+        assert_eq!(failover.rate_limit_cooldown_ms, 0);
+        assert_eq!(failover.max_request_retries, 3);
+        assert!(failover.credential_switch_on_429);
+
+        let turbo = RetryPolicy::preset(RetryMode::Turbo);
+        assert_eq!(turbo.rate_limit_cooldown_ms, 1_000);
+        assert_eq!(turbo.max_request_retries, 12);
+
+        let polite = RetryPolicy::preset(RetryMode::Polite);
+        assert!(!polite.credential_switch_on_429);
+        assert!(polite.respect_retry_after);
+
+        let custom = RetryPolicy {
+            rate_limit_cooldown_ms: 500,
+            max_request_retries: 2,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            credential_switch_on_429: true,
+            respect_retry_after: true,
+        };
+        assert_eq!(
+            RetryPolicy::effective(RetryMode::Custom, Some(&custom)).unwrap(),
+            custom
+        );
+
+        let invalid = RetryPolicy {
+            max_request_retries: 31,
+            ..RetryPolicy::preset(RetryMode::Fast)
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn test_report_rate_limited_skips_credential_without_disabling() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+        assert!(manager.report_rate_limited(1, StdDuration::from_millis(1_000)));
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(2)
+        );
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!first.disabled);
+        assert!(first.rate_limited_remaining_ms.is_some());
+
+        manager.clear_throttle(1).unwrap();
+        assert_eq!(
+            manager.select_next_credential(None, None).map(|(id, _)| id),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_set_retry_policy_persists_to_config_file() {
+        let path = tmp_creds_path("retry_policy_config");
+        let config = Config::load(&path).unwrap();
+        config.save().unwrap();
+
+        let manager = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+        let custom = RetryPolicy {
+            rate_limit_cooldown_ms: 750,
+            max_request_retries: 2,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            credential_switch_on_429: false,
+            respect_retry_after: true,
+        };
+
+        manager
+            .set_retry_policy(RetryMode::Custom, Some(custom.clone()))
+            .unwrap();
+        let persisted = Config::load(&path).unwrap();
+        assert_eq!(persisted.retry_mode, RetryMode::Custom);
+        assert_eq!(persisted.retry_policy, Some(custom));
 
         let _ = std::fs::remove_file(&path);
     }

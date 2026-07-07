@@ -5,7 +5,7 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
-use reqwest::Client;
+use reqwest::{Client, header};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::TlsBackend;
+use crate::model::config::{RetryMode, RetryPolicy, TlsBackend};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -37,6 +37,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
+
+/// 可配置 429 策略的总重试次数硬上限。仅非默认策略使用，避免 GreyGunG 的高重试
+/// 预设在多账号池里无限放大。
+const MAX_POLICY_TOTAL_RETRIES: usize = 30;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -688,15 +692,24 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let (retry_mode, retry_policy) = self.effective_retry_policy()?;
+        let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut request_throttled_ids: HashSet<u64> = HashSet::new();
         // 会话级 RPM 记账去重（同 call_api_with_retry）
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx = match self.token_manager.acquire_context(None, None).await {
+            let ctx_result = if request_throttled_ids.is_empty() {
+                self.token_manager.acquire_context(None, None).await
+            } else {
+                self.token_manager
+                    .acquire_context_excluding(None, None, &request_throttled_ids)
+                    .await
+            };
+            let ctx = match ctx_result {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -751,6 +764,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = Self::retry_after_delay(response.headers(), &retry_policy);
 
             // 成功响应
             if status.is_success() {
@@ -804,6 +818,47 @@ impl KiroProvider {
 
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                if status.as_u16() == 429 {
+                    let switch_on_ordinary_429 =
+                        retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
+                    if switch_on_ordinary_429 {
+                        request_throttled_ids.insert(ctx.id);
+                        if self.token_manager.has_available_excluding(
+                            None,
+                            None,
+                            &request_throttled_ids,
+                        ) {
+                            if retry_mode != RetryMode::Failover {
+                                let cooldown = retry_after.unwrap_or_else(|| {
+                                    Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
+                                });
+                                self.token_manager.report_rate_limited(ctx.id, cooldown);
+                            }
+                            tracing::info!(
+                                "MCP 凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
+                                ctx.id,
+                                retry_mode
+                            );
+                            last_error = Some(anyhow::anyhow!(
+                                "MCP 请求失败（凭据 #{} 普通 429，已切换其它凭据重试）: {} {}",
+                                ctx.id,
+                                status,
+                                body
+                            ));
+                            continue;
+                        }
+                        if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
+                            let keep_excluded = Some(ctx.id);
+                            request_throttled_ids.clear();
+                            if let Some(id) = keep_excluded {
+                                request_throttled_ids.insert(id);
+                            }
+                        } else if retry_mode != RetryMode::Failover {
+                            request_throttled_ids.clear();
+                        }
+                    }
+                }
+
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -813,12 +868,13 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    // 429 限流用更长退避；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
+                    let delay = Self::retry_delay_for_status(
+                        status,
+                        attempt,
+                        retry_mode,
+                        &retry_policy,
+                        retry_after,
+                    );
                     sleep(delay).await;
                 }
                 continue;
@@ -856,7 +912,8 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let (retry_mode, retry_policy) = self.effective_retry_policy()?;
+        let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let mut request_throttled_ids: HashSet<u64> = HashSet::new();
@@ -968,6 +1025,7 @@ impl KiroProvider {
             let response = attempt_result.response;
 
             let status = response.status();
+            let retry_after = Self::retry_after_delay(response.headers(), &retry_policy);
 
             // 成功响应
             if status.is_success() {
@@ -1124,13 +1182,21 @@ impl KiroProvider {
                     attempt_start,
                 );
 
-                if !account_throttled {
+                let switch_on_ordinary_429 =
+                    retry_mode == RetryMode::Failover || retry_policy.credential_switch_on_429;
+                if !account_throttled && switch_on_ordinary_429 {
                     request_throttled_ids.insert(ctx.id);
                     if self.token_manager.has_available_excluding(
                         model.as_deref(),
                         group,
                         &request_throttled_ids,
                     ) {
+                        if retry_mode != RetryMode::Failover {
+                            let cooldown = retry_after.unwrap_or_else(|| {
+                                Duration::from_millis(retry_policy.rate_limit_cooldown_ms)
+                            });
+                            self.token_manager.report_rate_limited(ctx.id, cooldown);
+                        }
                         last_error = Some(anyhow::anyhow!(
                             "{} API 请求失败（凭据 #{} 429，已切换其它凭据重试）: {} {}",
                             api_type,
@@ -1138,10 +1204,14 @@ impl KiroProvider {
                             status,
                             body
                         ));
-                        tracing::info!("凭据 #{} 返回普通 429，本次请求优先切换其它凭据", ctx.id);
+                        tracing::info!(
+                            "凭据 #{} 返回普通 429，按 {} 策略优先切换其它凭据",
+                            ctx.id,
+                            retry_mode
+                        );
                         continue;
                     }
-                    if !request_throttled_ids.is_empty() {
+                    if retry_mode == RetryMode::Failover && !request_throttled_ids.is_empty() {
                         let keep_excluded = Some(ctx.id);
                         request_throttled_ids.clear();
                         if let Some(id) = keep_excluded {
@@ -1151,6 +1221,8 @@ impl KiroProvider {
                             "本轮可用凭据均返回普通 429，开启下一轮并暂避凭据 #{}。",
                             ctx.id
                         );
+                    } else if retry_mode != RetryMode::Failover {
+                        request_throttled_ids.clear();
                     }
                 }
 
@@ -1361,12 +1433,13 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
-                    } else {
-                        Self::retry_delay(attempt)
-                    };
+                    let delay = Self::retry_delay_for_status(
+                        status,
+                        attempt,
+                        retry_mode,
+                        &retry_policy,
+                        retry_after,
+                    );
                     sleep(delay).await;
                 }
                 continue;
@@ -1466,6 +1539,38 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    fn effective_retry_policy(&self) -> anyhow::Result<(RetryMode, RetryPolicy)> {
+        let (mode, _, effective) = self.token_manager.get_retry_policy()?;
+        Ok((mode, effective))
+    }
+
+    fn max_retries(total_credentials: usize, mode: RetryMode, policy: &RetryPolicy) -> usize {
+        if mode == RetryMode::Failover {
+            (total_credentials.max(1) * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES)
+        } else {
+            (total_credentials.max(1) * policy.max_request_retries).min(MAX_POLICY_TOTAL_RETRIES)
+        }
+    }
+
+    fn retry_after_delay(headers: &header::HeaderMap, policy: &RetryPolicy) -> Option<Duration> {
+        if !policy.respect_retry_after {
+            return None;
+        }
+
+        let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+
+        if let Ok(date) = httpdate::parse_http_date(value) {
+            if let Ok(duration) = date.duration_since(std::time::SystemTime::now()) {
+                return Some(duration);
+            }
+        }
+
+        None
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -1475,6 +1580,36 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn retry_delay_policy(attempt: usize, policy: &RetryPolicy) -> Duration {
+        let exp = policy
+            .base_backoff_ms
+            .saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(policy.max_backoff_ms);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn retry_delay_for_status(
+        status: reqwest::StatusCode,
+        attempt: usize,
+        mode: RetryMode,
+        policy: &RetryPolicy,
+        retry_after: Option<Duration>,
+    ) -> Duration {
+        if mode == RetryMode::Failover {
+            if status.as_u16() == 429 {
+                Self::retry_delay_throttle(attempt)
+            } else {
+                Self::retry_delay(attempt)
+            }
+        } else if status.as_u16() == 429 {
+            retry_after.unwrap_or_else(|| Self::retry_delay_policy(attempt, policy))
+        } else {
+            Self::retry_delay_policy(attempt, policy)
+        }
     }
 
     /// 429 限流专用退避：比通用退避更长。
