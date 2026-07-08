@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint};
+use kiro::endpoint::{
+    AmazonQEndpoint, CliEndpoint, CodeWhispererEndpoint, IdeEndpoint, KiroEndpoint,
+    RuntimeEndpoint, RuntimeCliEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -118,14 +121,29 @@ async fn main() {
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
+        // 主协议端点（可作为 default_endpoint / 凭据 endpoint 字段）
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
         let cli = CliEndpoint::new();
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
-        // runtime.kiro.dev：与 q.amazonaws.com 限流桶独立，作为 ide/cli 的 429 降级目标。
-        // 无需出现在 default_endpoint / 凭据 endpoint 字段里，仅作内部 fallback。
+
+        // 429 降级桶（换桶不换号）：均为内部 fallback 目标，无需出现在配置里。
+        // 参考 demo 的多端点重试，并把 runtime 建成独立限流桶。
+        //
+        // IDE 协议链（origin=AI_EDITOR）：ide(q) ↔ runtime(kiro.dev) ↔ codewhisperer(独立 host) ↔ amazonq(q 上不同服务)
+        // runtime.kiro.dev：与 q.amazonaws.com 限流桶独立
         let runtime = RuntimeEndpoint::new();
         endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
+        // codewhisperer.amazonaws.com：独立 host 的 IDE 协议桶（demo index 1）
+        let codewhisperer = CodeWhispererEndpoint::new();
+        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        // q host 上的 AmazonQ Developer 服务（demo index 2，不同 x-amz-target）
+        let amazonq = AmazonQEndpoint::new();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
+
+        // CLI 协议链（origin=KIRO_CLI）：cli(q) ↔ runtime_cli(kiro.dev)——同协议降级，不改凭据身份
+        let runtime_cli = RuntimeCliEndpoint::new();
+        endpoints.insert(runtime_cli.name().to_string(), Arc::new(runtime_cli));
     }
 
     // 校验默认端点存在

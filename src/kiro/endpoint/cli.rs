@@ -57,9 +57,12 @@ impl KiroEndpoint for CliEndpoint {
         CLI_ENDPOINT_NAME
     }
 
-    /// cli 走 `q.amazonaws.com`；429 时降级到独立限流桶 `runtime.kiro.dev`。
-    fn fallback_endpoint(&self) -> Option<&'static str> {
-        Some(crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME)
+    /// cli 走 `q.amazonaws.com`（CLI 协议：KIRO_CLI origin + aws-sdk-rust UA +
+    /// x-amz-json-1.0）。429 时降级到独立限流桶 `runtime.kiro.dev` 上的**同协议**端点
+    /// runtime_cli——绝不能降级到 IDE 协议的 runtime，否则会把 CLI 凭据的身份悄悄改成 IDE。
+    fn fallback_chain(&self) -> &'static [&'static str] {
+        use crate::kiro::endpoint::runtime_cli::RUNTIME_CLI_ENDPOINT_NAME;
+        &[RUNTIME_CLI_ENDPOINT_NAME]
     }
 
     fn content_type(&self) -> &'static str {
@@ -127,7 +130,9 @@ impl KiroEndpoint for CliEndpoint {
 /// 1. 所有 "AI_EDITOR" origin 替换为 "KIRO_CLI"
 /// 2. 移除 conversationState.agentContinuationId（Kiro CLI 不发送此字段）
 /// 3. 移除 history 中用户消息的 modelId（Kiro CLI 不在历史消息里发送此字段）
-fn set_origin_kiro_cli(body: &str) -> String {
+///
+/// runtime_cli 端点（`runtime_cli.rs`）与 cli 端点的请求体加工完全一致，直接复用本函数。
+pub(crate) fn set_origin_kiro_cli(body: &str) -> String {
     let body = body.replace("\"origin\":\"AI_EDITOR\"", "\"origin\":\"KIRO_CLI\"");
 
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&body) else {

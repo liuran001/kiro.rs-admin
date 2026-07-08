@@ -1,17 +1,13 @@
-//! Kiro Runtime 端点
+//! Kiro AmazonQ 端点（IDE 协议 / q host 上的独立服务）
 //!
-//! 对应 Kiro IDE 客户端较新的 `runtime.kiro.dev` 推理链路：
-//! - API: `https://runtime.{api_region}.kiro.dev/generateAssistantResponse`
-//! - MCP: `https://runtime.{api_region}.kiro.dev/mcp`
+//! 对应 demo（kiro-go）中 index 2 的 "AmazonQ" 端点：
+//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
+//! - X-Amz-Target: `AmazonQDeveloperStreamingService.SendMessage`
 //!
-//! 请求头、请求体加工（注入 profileArn、origin=AI_EDITOR）与 [`super::ide::IdeEndpoint`]
-//! **完全一致**，唯一差别是域名从 `q.{region}.amazonaws.com` 换成
-//! `runtime.{region}.kiro.dev`。
-//!
-//! 关键价值：实测 `runtime.kiro.dev` 与 `q.amazonaws.com` 是**两个独立的限流桶**——
-//! 一个 429 时另一个仍可 200。本端点是 IDE 协议 429 降级链（见
-//! [`super::KiroEndpoint::fallback_chain`]）中最独立的一个桶（独立域名），
-//! 详见 `provider.rs` 的 429 处理。
+//! 与 [`super::ide::IdeEndpoint`] **同协议、同 host**，仅 x-amz-target 指向
+//! AmazonQ Developer 服务（而非默认的 CodeWhisperer 路由）。同 host 上不同服务
+//! 可能命中不同的服务级配额，故作为 IDE 协议 429 降级链的最后一个桶
+//! （见 [`super::KiroEndpoint::fallback_chain`]）。
 
 use reqwest::RequestBuilder;
 use uuid::Uuid;
@@ -20,13 +16,16 @@ use super::ide::inject_profile_arn;
 use super::{KiroEndpoint, RequestContext};
 use crate::kiro::kiro_version;
 
-/// Kiro Runtime 端点名称
-pub const RUNTIME_ENDPOINT_NAME: &str = "runtime";
+/// Kiro AmazonQ 端点名称
+pub const AMAZONQ_ENDPOINT_NAME: &str = "amazonq";
 
-/// Kiro Runtime 端点
-pub struct RuntimeEndpoint;
+/// AmazonQ Developer 流式服务的 x-amz-target
+const AMAZONQ_AMZ_TARGET: &str = "AmazonQDeveloperStreamingService.SendMessage";
 
-impl RuntimeEndpoint {
+/// Kiro AmazonQ 端点
+pub struct AmazonQEndpoint;
+
+impl AmazonQEndpoint {
     pub fn new() -> Self {
         Self
     }
@@ -36,7 +35,7 @@ impl RuntimeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -58,44 +57,44 @@ impl RuntimeEndpoint {
     }
 }
 
-impl Default for RuntimeEndpoint {
+impl Default for AmazonQEndpoint {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KiroEndpoint for RuntimeEndpoint {
+impl KiroEndpoint for AmazonQEndpoint {
     fn name(&self) -> &'static str {
-        RUNTIME_ENDPOINT_NAME
+        AMAZONQ_ENDPOINT_NAME
     }
 
-    /// runtime 走 `runtime.kiro.dev`（IDE 协议）。429 时沿链回切到 q 家族的独立限流桶：
-    /// ide（q host）→ codewhisperer（独立 host）→ amazonq（同 q host 不同服务）。链内全部 IDE 协议。
+    /// amazonq 走 q host 的 AmazonQ 服务；429 时沿 IDE 协议链切到其它独立桶。
     fn fallback_chain(&self) -> &'static [&'static str] {
         use crate::kiro::endpoint::{
-            amazonq::AMAZONQ_ENDPOINT_NAME, codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
-            ide::IDE_ENDPOINT_NAME,
+            codewhisperer::CODEWHISPERER_ENDPOINT_NAME, ide::IDE_ENDPOINT_NAME,
+            runtime::RUNTIME_ENDPOINT_NAME,
         };
         &[
-            IDE_ENDPOINT_NAME,
+            RUNTIME_ENDPOINT_NAME,
             CODEWHISPERER_ENDPOINT_NAME,
-            AMAZONQ_ENDPOINT_NAME,
+            IDE_ENDPOINT_NAME,
         ]
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://runtime.{}.kiro.dev/generateAssistantResponse",
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
             self.api_region(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://runtime.{}.kiro.dev/mcp", self.api_region(ctx))
+        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header("x-amz-target", AMAZONQ_AMZ_TARGET)
             .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amzn-kiro-agent-mode", "vibe")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
@@ -108,7 +107,6 @@ impl KiroEndpoint for RuntimeEndpoint {
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
         } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
             req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
@@ -129,7 +127,6 @@ impl KiroEndpoint for RuntimeEndpoint {
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
         } else if ctx.credentials.is_external_idp() {
-            // 外部 IdP（Entra ID / Azure AD）token 必须声明类型
             req = req.header("tokentype", "EXTERNAL_IDP");
         }
         req
@@ -146,41 +143,22 @@ mod tests {
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
 
-    fn ctx<'a>(
-        creds: &'a KiroCredentials,
-        config: &'a Config,
-        machine_id: &'a str,
-    ) -> RequestContext<'a> {
-        RequestContext {
-            credentials: creds,
-            token: "tok",
-            machine_id,
-            config,
-        }
-    }
-
     #[test]
-    fn test_runtime_urls_use_kiro_dev_domain() {
-        let endpoint = RuntimeEndpoint::new();
+    fn test_amazonq_url_uses_q_host() {
+        let endpoint = AmazonQEndpoint::new();
         let mut config = Config::default();
         config.api_region = Some("us-east-1".to_string());
         let creds = KiroCredentials::default();
-        let rctx = ctx(&creds, &config, "machine");
-
+        let ctx = RequestContext {
+            credentials: &creds,
+            token: "tok",
+            machine_id: "machine",
+            config: &config,
+        };
         assert_eq!(
-            endpoint.api_url(&rctx),
-            "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
+            endpoint.api_url(&ctx),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
         );
-        assert_eq!(endpoint.mcp_url(&rctx), "https://runtime.us-east-1.kiro.dev/mcp");
-        assert_eq!(endpoint.host(&rctx), "runtime.us-east-1.kiro.dev");
-    }
-
-    #[test]
-    fn test_runtime_fallback_chain_starts_with_ide() {
-        // runtime 429 时先回切 ide（q host），链内全部为 IDE 协议
-        assert_eq!(
-            RuntimeEndpoint::new().fallback_chain().first().copied(),
-            Some(super::super::ide::IDE_ENDPOINT_NAME)
-        );
+        assert_eq!(endpoint.host(&ctx), "q.us-east-1.amazonaws.com");
     }
 }

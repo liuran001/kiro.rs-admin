@@ -61,9 +61,19 @@ impl KiroEndpoint for IdeEndpoint {
         IDE_ENDPOINT_NAME
     }
 
-    /// ide 走 `q.amazonaws.com`；429 时降级到独立限流桶 `runtime.kiro.dev`。
-    fn fallback_endpoint(&self) -> Option<&'static str> {
-        Some(crate::kiro::endpoint::runtime::RUNTIME_ENDPOINT_NAME)
+    /// ide 走 `q.amazonaws.com`（IDE 协议）。429 时沿链依次降级到其它独立限流桶：
+    /// runtime（独立域名，最独立的桶）→ codewhisperer（独立 host）→ amazonq（同 host 不同服务）。
+    /// 链内全部为 IDE 协议，换桶不换号、不改凭据身份。参考 demo 的多端点重试 + runtime 桶。
+    fn fallback_chain(&self) -> &'static [&'static str] {
+        use crate::kiro::endpoint::{
+            amazonq::AMAZONQ_ENDPOINT_NAME, codewhisperer::CODEWHISPERER_ENDPOINT_NAME,
+            runtime::RUNTIME_ENDPOINT_NAME,
+        };
+        &[
+            RUNTIME_ENDPOINT_NAME,
+            CODEWHISPERER_ENDPOINT_NAME,
+            AMAZONQ_ENDPOINT_NAME,
+        ]
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {

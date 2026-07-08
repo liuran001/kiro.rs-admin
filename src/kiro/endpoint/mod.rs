@@ -11,13 +11,19 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
+pub mod codewhisperer;
 pub mod ide;
 pub mod runtime;
+pub mod runtime_cli;
 
+pub use amazonq::AmazonQEndpoint;
 pub use cli::CliEndpoint;
+pub use codewhisperer::CodeWhispererEndpoint;
 pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
+pub use runtime_cli::RuntimeCliEndpoint;
 
 /// Kiro 端点
 ///
@@ -26,15 +32,22 @@ pub trait KiroEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
 
-    /// 429 限流时可降级到的备用端点名（一个**独立的限流桶**）。
+    /// 429 限流时按顺序降级的备用端点链（每个都是一个**独立的限流桶**）。
     ///
-    /// 实测 `runtime.kiro.dev` 与 `q.amazonaws.com` 限流桶相互独立：一个 429 时
-    /// 另一个仍可 200。`provider.rs` 在收到 429（非账号级风控）时，会用**同一张凭据**
-    /// 立刻在此备用端点上重发一次，换桶不换号；备用端点也 429 才落回换凭据/退避逻辑。
+    /// 参考 demo（kiro-go）的多端点重试：单张凭据在主端点 429 时，会沿本链
+    /// **依次**尝试每个备用桶（换桶不换号），命中第一个 2xx 即返回；整条链都失败
+    /// 才落回换凭据/退避逻辑。
     ///
-    /// 返回 `None` 表示该端点无备用桶，429 时直接走原有重试逻辑。
-    fn fallback_endpoint(&self) -> Option<&'static str> {
-        None
+    /// 实测 `q.amazonaws.com`、`runtime.kiro.dev`、`codewhisperer.amazonaws.com`
+    /// 是相互独立的限流桶（一个 429 时另一个仍可 200）；同一 host 上不同
+    /// `x-amz-target` 的服务（如 CodeWhisperer vs AmazonQ）也可能有独立的服务级配额。
+    ///
+    /// **链内所有端点必须与主端点同协议**（同 origin / UA / 请求体加工），否则会在
+    /// 降级时悄悄改变凭据身份。IDE 协议链只含 IDE 协议端点，CLI 协议链只含 CLI 协议端点。
+    ///
+    /// 返回空切片表示该端点无备用桶，429 时直接走原有重试逻辑。
+    fn fallback_chain(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// API 请求的 Content-Type（默认 application/json）

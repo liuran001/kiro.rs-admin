@@ -32,3 +32,5 @@
 .codegraph/
 .claude/
 test/
+# 第三方演示
+demo/
