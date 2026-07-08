@@ -537,6 +537,30 @@ impl KiroProvider {
     async fn ensure_profile_arn(&self, ctx: &mut crate::kiro::token_manager::CallContext) {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
+        // 惰性清理：进程内去重集只增不减，凭据被删除后（next_id 单调递增）会留下死 id。
+        // 当集合规模超过当前凭据总数时，按「id 是否仍存在」剔除死 id，止住内存泄漏。
+        // 仅在超阈值时才做，正常路径零开销。先快照待查 id 再释放锁，避免嵌套持锁
+        // （profile_resolution_attempted 与 token_manager.entries）引发的锁序问题。
+        {
+            let live = self.token_manager.total_count();
+            let candidates: Option<Vec<u64>> = {
+                let set = self.profile_resolution_attempted.lock();
+                (set.len() > live).then(|| set.iter().copied().collect())
+            };
+            if let Some(ids) = candidates {
+                let dead: Vec<u64> = ids
+                    .into_iter()
+                    .filter(|id| !self.token_manager.credential_exists(*id))
+                    .collect();
+                if !dead.is_empty() {
+                    let mut set = self.profile_resolution_attempted.lock();
+                    for id in dead {
+                        set.remove(&id);
+                    }
+                }
+            }
+        }
+
         if ctx.credentials.is_api_key_credential() {
             return;
         }
@@ -910,8 +934,9 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
-        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
+        // 重试预算按当前请求所属分组的「可用」账号数计算（排除 disabled/throttled），
+        // 避免删除/禁用凭据后仍按历史峰值获得过多无效重试（首字延迟阶梯增长的一环）。
+        let total_credentials = self.token_manager.available_count_in_group(group).max(1);
         let (retry_mode, retry_policy) = self.effective_retry_policy()?;
         let max_retries = Self::max_retries(total_credentials, retry_mode, &retry_policy);
         let mut last_error: Option<anyhow::Error> = None;

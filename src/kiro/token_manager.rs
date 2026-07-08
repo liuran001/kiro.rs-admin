@@ -1034,6 +1034,12 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// `acquire_context` 换凭据尝试次数硬上限。
+///
+/// 预算基数 = 可用凭据数 × MAX_FAILURES_PER_CREDENTIAL，但必须封顶：凭据很多时，
+/// 每次循环里挑到的凭据都可能触发一次 `try_ensure_token` 网络往返（token 刷新），
+/// 无界循环会把首字延迟按凭据数线性放大。取较小值，让获取上下文快速失败而非硬耗。
+const MAX_ACQUIRE_ATTEMPTS: usize = 6;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1313,6 +1319,14 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
+    /// 判断给定凭据 id 是否仍存在于当前 entries（未被删除）。
+    ///
+    /// 供 provider 惰性清理进程内按 id 累积的辅助集合（如 profileArn 解析去重集），
+    /// 剔除已删除凭据留下的死 id。
+    pub fn credential_exists(&self, id: u64) -> bool {
+        self.entries.lock().iter().any(|e| e.id == id)
+    }
+
     /// 获取指定分组的凭据总数（group=None 时等于 total_count）
     ///
     /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
@@ -1334,6 +1348,25 @@ impl MultiTokenManager {
                 !e.disabled
                     && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                     && !e.rate_limited_until.map(|t| t > now).unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// 获取指定分组内「当前可用」的凭据数（未禁用、未处于冷却）。
+    ///
+    /// 用作重试预算基数：`total_count_in_group` 会把 disabled/throttled 的凭据也算进去，
+    /// 导致删除/禁用凭据后预算仍按历史峰值膨胀，进而在首字路径上叠加更多无效重试与
+    /// token 刷新往返（首字延迟阶梯性增长的主因）。预算按真实可用数计算，删凭据后立即回落。
+    /// group=None 时等于 `available_count`。
+    pub fn available_count_in_group(&self, group: Option<&str>) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && group_matches(&e.credentials.groups, group)
             })
             .count()
     }
@@ -1471,8 +1504,14 @@ impl MultiTokenManager {
         group: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        // 预算按「当前可用」凭据数（排除 disabled/throttled）计算并封顶：
+        // 用 total（含禁用/冷却）会在删除/禁用凭据后仍按历史峰值膨胀，叠加无效重试与
+        // token 刷新往返，导致首字延迟阶梯性增长。total 仅保留用于错误信息展示。
         let total = self.total_count_in_group(group);
-        let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
+        let available = self.available_count_in_group(group);
+        let max_attempts = (available * MAX_FAILURES_PER_CREDENTIAL as usize)
+            .min(MAX_ACQUIRE_ATTEMPTS)
+            .max(1);
         let mut attempt_count = 0;
 
         loop {
@@ -5494,6 +5533,20 @@ mod tests {
         assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
         assert_eq!(manager.total_count_in_group(None), 3); // 全部
         assert_eq!(manager.total_count_in_group(Some("none")), 0);
+
+        // available_count_in_group 与 total 在全可用时一致
+        assert_eq!(manager.available_count_in_group(Some("g1")), 2);
+        assert_eq!(manager.available_count_in_group(None), 3);
+
+        // 禁用一个凭据后：total 不变，available 回落——这是重试预算的正确基数
+        manager.set_disabled(1, true).unwrap();
+        assert_eq!(manager.total_count_in_group(None), 3, "total 仍含禁用凭据");
+        assert_eq!(
+            manager.available_count_in_group(None),
+            2,
+            "available 应排除禁用凭据"
+        );
+        assert_eq!(manager.available_count_in_group(Some("g1")), 1, "g1 少了被禁用的 A");
     }
 
     #[test]
