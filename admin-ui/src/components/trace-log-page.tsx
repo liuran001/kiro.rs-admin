@@ -149,28 +149,54 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'unknown', label: '未知' },
 ]
 
-/** 单跳明细行 */
-function AttemptRow({ a }: { a: TraceAttempt }) {
-  const style = outcomeStyle(a.outcome)
+/** 失败分类 → 状态码文字色（链式箭头里给状态码上色，不用整块 Badge） */
+function outcomeTextColor(outcome: string): string {
+  switch (outcome) {
+    case 'success':
+      return 'text-emerald-600 dark:text-emerald-400'
+    case 'quota_exhausted':
+    case 'account_throttled':
+    case 'stream_interrupted':
+      return 'text-amber-600 dark:text-amber-400'
+    case 'auth_failed':
+    case 'network_error':
+    case 'bad_request':
+      return 'text-destructive'
+    default:
+      return 'text-muted-foreground'
+  }
+}
+
+/** 单跳的 hover 详情（凭据 / 分类 / 状态码 / 耗时 / 错误片段） */
+function attemptTitle(a: TraceAttempt): string {
+  const parts = [
+    `#${a.attempt} ${outcomeStyle(a.outcome).label}`,
+    `端点 ${a.endpoint || '—'}`,
+    `凭据 ${credLabel(a.credentialId, a.email)}`,
+    `HTTP ${a.httpStatus ?? '网络失败'}`,
+    formatDuration(a.durationMs),
+  ]
+  if (a.errorSnippet) parts.push(`\n${a.errorSnippet}`)
+  return parts.join(' · ')
+}
+
+/**
+ * 重试链路：一行链式箭头。
+ * 例：ide 429 → runtime 429 → codewhisperer 200
+ * 每跳只显示「端点 + 状态码」，状态码按 outcome 上色；完整信息在 hover title 里。
+ */
+function AttemptChain({ attempts }: { attempts: TraceAttempt[] }) {
   return (
-    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
-      <div className="flex flex-wrap items-center gap-2 text-[13px]">
-        <span className="font-mono text-muted-foreground">#{a.attempt}</span>
-        <Badge variant={style.variant}>{style.label}</Badge>
-        <span className="text-muted-foreground">凭据</span>
-        <span className="font-medium">{credLabel(a.credentialId, a.email)}</span>
-        {a.endpoint && <Badge variant="outline">{a.endpoint}</Badge>}
-        <span className="text-muted-foreground">HTTP</span>
-        <span className="font-mono">{a.httpStatus ?? '—'}</span>
-        <span className="ml-auto font-mono text-muted-foreground">
-          {formatDuration(a.durationMs)}
+    <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-[12px]">
+      {attempts.map((a, i) => (
+        <span key={a.attempt} className="inline-flex items-center gap-x-1.5">
+          {i > 0 && <span className="select-none text-muted-foreground/50">→</span>}
+          <span className="inline-flex items-center gap-1" title={attemptTitle(a)}>
+            <span className="text-foreground/80">{a.endpoint || '—'}</span>
+            <span className={outcomeTextColor(a.outcome)}>{a.httpStatus ?? '×'}</span>
+          </span>
         </span>
-      </div>
-      {a.errorSnippet && (
-        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background/60 p-2 font-mono text-[11px] text-muted-foreground">
-          {a.errorSnippet}
-        </pre>
-      )}
+      ))}
     </div>
   )
 }
@@ -322,13 +348,13 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
         尝试链路（{rec.attempts.length} 次
         {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）
       </div>
-      <div className="space-y-2">
-        {rec.attempts.length === 0 ? (
-          <div className="text-[13px] text-muted-foreground">无尝试记录（请求未到达上游）</div>
-        ) : (
-          rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
-        )}
-      </div>
+      {rec.attempts.length === 0 ? (
+        <div className="text-[13px] text-muted-foreground">无尝试记录（请求未到达上游）</div>
+      ) : (
+        <div className="rounded-lg border border-border/50 bg-secondary/30 px-3 py-2">
+          <AttemptChain attempts={rec.attempts} />
+        </div>
+      )}
     </div>
   )
 }
