@@ -123,7 +123,7 @@ pub struct Config {
     #[serde(default = "default_update_auto_apply_time")]
     pub update_auto_apply_time: String,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority" / "balanced" / "least_conn"，默认 "least_conn" 最少负载）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
@@ -210,7 +210,8 @@ fn default_tls_backend() -> TlsBackend {
 }
 
 fn default_load_balancing_mode() -> String {
-    "priority".to_string()
+    // 默认最少负载：把请求优先分给当前在途请求数最少的凭据，避免高优先级凭据被打爆。
+    "least_conn".to_string()
 }
 
 fn default_account_throttle_failover() -> bool {

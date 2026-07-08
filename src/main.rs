@@ -166,7 +166,21 @@ async fn main() {
         }
     }
 
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    let mut endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    endpoint_names.sort();
+
+    // 启动时打印限流/重试/负载相关配置，便于运维确认开关是否生效
+    tracing::info!("已注册端点桶: {:?}", endpoint_names);
+    tracing::info!("默认端点: {}", config.default_endpoint);
+    tracing::info!("负载均衡模式: {}", config.load_balancing_mode);
+    if config.account_throttle_failover {
+        tracing::info!(
+            "账号级风控转移: 开启（检测到 suspicious activity 时冷却 {}s 并切换凭据）",
+            config.account_throttle_cooldown_secs
+        );
+    } else {
+        tracing::info!("账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）");
+    }
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
