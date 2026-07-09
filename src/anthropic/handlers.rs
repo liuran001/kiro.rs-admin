@@ -616,10 +616,10 @@ pub async fn post_messages(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -688,10 +688,10 @@ pub async fn post_messages(
 
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     // 检查是否启用了thinking
@@ -1315,10 +1315,10 @@ pub async fn count_tokens(
     );
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     Json(CountTokensResponse {
@@ -1371,10 +1371,10 @@ pub async fn post_messages_cc(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -1442,10 +1442,10 @@ pub async fn post_messages_cc(
 
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     // 检查是否启用了thinking

@@ -104,12 +104,15 @@ pub fn count_tokens(text: &str) -> u64 {
 
 /// 估算请求的输入 tokens
 ///
-/// 优先调用远程 API，失败时回退到本地计算
+/// 优先调用远程 API，失败时回退到本地计算。
+///
+/// 全部按引用收参：本函数在首字关键路径上每轮被调用一次，按值收参会导致每轮把
+/// 整段会话（messages/system/tools）深拷贝一份，随对话轮数线性放大首字延迟。
 pub(crate) fn count_all_tokens(
-    model: String,
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     // 检查是否配置了远程 API
     if let Some(config) = get_config() {
@@ -117,7 +120,7 @@ pub(crate) fn count_all_tokens(
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
+                    api_url, config, model, system, messages, tools,
                 ))
             });
 
@@ -141,19 +144,20 @@ pub(crate) fn count_all_tokens(
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
-    model: String,
-    system: &Option<Vec<SystemMessage>>,
-    messages: &Vec<Message>,
-    tools: &Option<Vec<Tool>>,
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
-    // 构建请求体
+    // 构建请求体（远程 API 需要拥有所有权的请求体，仅此分支付一次 clone；
+    // 未配置远程 API 的默认路径不进入此函数，无 clone 开销）。
     let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
-        system: system.clone(),
-        tools: tools.clone(),
+        model: model.to_string(),
+        messages: messages.to_vec(),
+        system: system.map(|s| s.to_vec()),
+        tools: tools.map(|t| t.to_vec()),
     };
 
     // 构建请求
@@ -185,21 +189,21 @@ async fn call_remote_count_tokens(
 
 /// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     let mut total = 0;
 
     // 系统消息
-    if let Some(ref system) = system {
+    if let Some(system) = system {
         for msg in system {
             total += count_tokens(&msg.text);
         }
     }
 
     // 用户消息
-    for msg in &messages {
+    for msg in messages {
         if let serde_json::Value::String(s) = &msg.content {
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
@@ -212,7 +216,7 @@ fn count_all_tokens_local(
     }
 
     // 工具定义
-    if let Some(ref tools) = tools {
+    if let Some(tools) = tools {
         for tool in tools {
             total += count_tokens(&tool.name);
             total += count_tokens(&tool.description);
