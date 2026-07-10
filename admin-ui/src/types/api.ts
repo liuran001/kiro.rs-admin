@@ -487,6 +487,14 @@ export interface TraceAttempt {
   durationMs: number
 }
 
+/** 单个处理阶段的耗时打点 */
+export interface TraceStage {
+  /** 阶段名：convert / serialize / acquire / profile_arn / execute / metering / decode */
+  name: string
+  /** 该阶段耗时（毫秒） */
+  durationMs: number
+}
+
 /** 一个外部请求的完整链路 */
 export interface TraceRecord {
   traceId: string
@@ -522,6 +530,8 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 各处理阶段耗时（按发生顺序）；空表示未打点（老库/未启用） */
+  stages?: TraceStage[]
   attempts: TraceAttempt[]
 }
 

@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
-    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, TraceStage, outcome,
 };
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -133,6 +133,8 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 各处理阶段耗时（按 mark_stage 调用顺序累积）
+    stages: parking_lot::Mutex<Vec<TraceStage>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -171,6 +173,7 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            stages: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -180,6 +183,15 @@ impl RequestTracer {
         if slot.is_none() {
             *slot = Some(Instant::now());
         }
+    }
+
+    /// 记录一个处理阶段的耗时（毫秒）。按调用顺序累积到 stages。
+    /// store 为 None（未启用 trace）时也累积，开销极小；finalize 时若无 store 才丢弃。
+    pub fn mark_stage(&self, name: &str, elapsed: std::time::Duration) {
+        self.stages.lock().push(TraceStage {
+            name: name.to_string(),
+            duration_ms: elapsed.as_millis() as u64,
+        });
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -219,6 +231,7 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            stages: std::mem::take(&mut *self.stages.lock()),
             attempts,
         };
         store.insert(&rec);
@@ -228,6 +241,10 @@ impl RequestTracer {
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
+    }
+
+    fn on_stage(&self, stage: TraceStage) {
+        self.stages.lock().push(stage);
     }
 }
 
@@ -639,6 +656,7 @@ pub async fn post_messages(
     }
 
     // 转换请求
+    let stage_convert_start = Instant::now();
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
@@ -660,8 +678,11 @@ pub async fn post_messages(
         }
     };
 
+    let stage_convert_ms = stage_convert_start.elapsed();
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
+    let stage_serialize_start = Instant::now();
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -683,6 +704,8 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    let stage_serialize_ms = stage_serialize_start.elapsed();
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -723,16 +746,21 @@ pub async fn post_messages(
         }
     };
 
+    // tracer 提前创建一次，补记首字之前已发生的 convert/serialize 两阶段耗时，
+    // 再传入下游 handler（provider 会通过 on_stage 继续追加 acquire/execute 等阶段）。
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: model.clone(),
+            is_stream,
+        },
+    ));
+    tracer.mark_stage("convert", stage_convert_ms);
+    tracer.mark_stage("serialize", stage_serialize_ms);
+
     if is_stream {
         // 流式响应
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_stream_request(
             provider,
             &request_body,
@@ -749,14 +777,6 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -805,7 +825,9 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 上游已返回（首字已拿到）：此刻再做计量，不阻塞 TTFT。
+    let stage_metering_start = Instant::now();
     let (input_tokens, cache_usage) = compute_metering();
+    tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
@@ -1006,11 +1028,14 @@ async fn handle_non_stream_request(
     };
 
     // 上游已返回：此刻求值计量，不阻塞响应返回。
+    let stage_metering_start = Instant::now();
     let (input_tokens, cache_usage) = compute_metering();
+    tracer.mark_stage("metering", stage_metering_start.elapsed());
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
     // 读取响应体
+    let stage_decode_start = Instant::now();
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1197,6 +1222,8 @@ async fn handle_non_stream_request(
         }
     });
 
+    // decode=读响应体 + 解析事件流的耗时（非流式路径）
+    tracer.mark_stage("decode", stage_decode_start.elapsed());
     hook.record(
         credential_id,
         final_input_tokens,
@@ -1414,6 +1441,7 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
+    let stage_convert_start = Instant::now();
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
@@ -1435,8 +1463,11 @@ pub async fn post_messages_cc(
         }
     };
 
+    let stage_convert_ms = stage_convert_start.elapsed();
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
+    let stage_serialize_start = Instant::now();
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1458,6 +1489,8 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    let stage_serialize_ms = stage_serialize_start.elapsed();
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1494,16 +1527,20 @@ pub async fn post_messages_cc(
         }
     };
 
+    // tracer 提到分支前创建一次，先补记 convert/serialize 两个阶段耗时（发生在 tracer 之前）。
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: model.clone(),
+            is_stream,
+        },
+    ));
+    tracer.mark_stage("convert", stage_convert_ms);
+    tracer.mark_stage("serialize", stage_serialize_ms);
+
     if is_stream {
         // 流式响应（缓冲模式）
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -1520,14 +1557,6 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1575,7 +1604,9 @@ async fn handle_stream_request_buffered(
     let credential_id = call_result.credential_id;
 
     // 上游已返回：此刻求值计量，不阻塞首字。
+    let stage_metering_start = Instant::now();
     let (fallback_input_tokens, cache_usage) = compute_metering();
+    tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(

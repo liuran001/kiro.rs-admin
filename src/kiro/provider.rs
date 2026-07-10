@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
+use crate::admin::trace_db::{TraceAttempt, TraceSink, TraceStage, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
@@ -516,6 +516,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
+            let stage_acquire_start = Instant::now();
             let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -527,6 +528,7 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let stage_acquire = stage_acquire_start.elapsed();
             // least_conn 在途计数守卫：随本次迭代作用域结束自动 -1，覆盖所有退出路径
             // （return/continue/bail!/? 早退）。必须具名绑定，裸 `_` 会立即 Drop。
             let _in_flight = self.token_manager.in_flight_guard(ctx.id);
@@ -537,7 +539,9 @@ impl KiroProvider {
             }
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
+            let stage_profile_start = Instant::now();
             self.ensure_profile_arn(&mut ctx).await;
+            let stage_profile = stage_profile_start.elapsed();
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -556,6 +560,7 @@ impl KiroProvider {
             };
             let endpoint_name = endpoint.name();
 
+            let stage_execute_start = Instant::now();
             let response = match self
                 .execute_api_request(&endpoint, &ctx, &machine_id, config, request_body)
                 .await
@@ -582,6 +587,8 @@ impl KiroProvider {
                 }
             };
 
+            let stage_execute = stage_execute_start.elapsed();
+
             let status = response.status();
 
             // 成功响应
@@ -593,6 +600,11 @@ impl KiroProvider {
                     attempt + 1,
                     max_retries
                 );
+                // 上报本次成功链路的阶段耗时（首字之前的 provider 侧拆解：
+                // acquire=选凭据+刷 token，profile_arn=解析真实 ARN，execute=上游到响应头）。
+                Self::emit_stage(sink, "acquire", stage_acquire);
+                Self::emit_stage(sink, "profile_arn", stage_profile);
+                Self::emit_stage(sink, "execute", stage_execute);
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
@@ -973,6 +985,17 @@ impl KiroProvider {
             http_status,
             outcome: outcome.to_string(),
             error_snippet: error_body.and_then(truncate_snippet),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+
+    /// 向 trace sink 上报一个阶段耗时（sink 为 None 时无开销）。
+    /// 用于把首字前的耗时拆到 acquire(选凭据+刷 token) / profile_arn(解析 ARN) /
+    /// execute(上游首字) 等细粒度阶段，便于分析延迟来源。
+    fn emit_stage(sink: Option<&dyn TraceSink>, name: &str, started: Instant) {
+        let Some(sink) = sink else { return };
+        sink.on_stage(TraceStage {
+            name: name.to_string(),
             duration_ms: started.elapsed().as_millis() as u64,
         });
     }

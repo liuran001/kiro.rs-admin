@@ -201,6 +201,53 @@ function AttemptChain({ attempts }: { attempts: TraceAttempt[] }) {
   )
 }
 
+/** 阶段名 → 中文标签。首字之前(convert→execute) + 首字之后(metering/decode)。 */
+const STAGE_LABELS: Record<string, string> = {
+  convert: '转换',
+  serialize: '序列化',
+  acquire: '选凭据/刷Token',
+  profile_arn: '解析ARN',
+  execute: '上游到首字',
+  metering: '计量',
+  decode: '解码',
+}
+
+/**
+ * 各处理阶段耗时：一行「阶段 耗时」序列，按发生顺序排列，最慢的阶段高亮。
+ * 用于分析首字延迟到底卡在哪一步（如 execute 偏高 = 上游慢，acquire 偏高 = 选凭据/刷 token 慢）。
+ */
+function StageTimeline({ stages }: { stages: NonNullable<TraceRecord['stages']> }) {
+  if (stages.length === 0) return null
+  const max = Math.max(...stages.map((s) => s.durationMs))
+  const total = stages.reduce((sum, s) => sum + s.durationMs, 0)
+  return (
+    <div className="space-y-1.5">
+      <div className="text-[12px] font-medium text-muted-foreground">
+        阶段耗时（合计 {formatDuration(total)}）
+      </div>
+      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-[12px]">
+        {stages.map((s, i) => {
+          const slowest = s.durationMs === max && max > 0
+          return (
+            <span key={`${s.name}-${i}`} className="inline-flex items-center gap-x-1.5">
+              {i > 0 && <span className="select-none text-muted-foreground/50">→</span>}
+              <span
+                className="inline-flex items-center gap-1"
+                title={`${STAGE_LABELS[s.name] ?? s.name}: ${s.durationMs}ms`}
+              >
+                <span className="text-foreground/70">{STAGE_LABELS[s.name] ?? s.name}</span>
+                <span className={slowest ? 'font-semibold text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}>
+                  {formatDuration(s.durationMs)}
+                </span>
+              </span>
+            </span>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 /** 可展开的链路行 */
 /** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
 function TokenCell({ rec }: { rec: TraceRecord }) {
@@ -344,6 +391,7 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
           中断前已发送 {rec.interruptedAfterBytes} 字节
         </div>
       )}
+      {rec.stages && rec.stages.length > 0 && <StageTimeline stages={rec.stages} />}
       <div className="text-[12px] font-medium text-muted-foreground">
         尝试链路（{rec.attempts.length} 次
         {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）
