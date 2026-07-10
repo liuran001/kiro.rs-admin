@@ -992,11 +992,11 @@ impl KiroProvider {
     /// 向 trace sink 上报一个阶段耗时（sink 为 None 时无开销）。
     /// 用于把首字前的耗时拆到 acquire(选凭据+刷 token) / profile_arn(解析 ARN) /
     /// execute(上游首字) 等细粒度阶段，便于分析延迟来源。
-    fn emit_stage(sink: Option<&dyn TraceSink>, name: &str, started: Instant) {
+    fn emit_stage(sink: Option<&dyn TraceSink>, name: &str, elapsed: std::time::Duration) {
         let Some(sink) = sink else { return };
         sink.on_stage(TraceStage {
             name: name.to_string(),
-            duration_ms: started.elapsed().as_millis() as u64,
+            duration_ms: elapsed.as_millis() as u64,
         });
     }
 
