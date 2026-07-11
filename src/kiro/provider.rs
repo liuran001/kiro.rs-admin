@@ -20,6 +20,26 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+/// 上游在所有重试/故障转移均失败后仍返回 429。
+///
+/// 使用独立错误类型，避免 Anthropic 适配层把限流误映射成 502；`retry_after`
+/// 原样保存上游响应头。账号级风控没有该响应头时，由调用处填入本地冷却时长。
+#[derive(Debug, thiserror::Error)]
+#[error("upstream rate limited")]
+pub struct UpstreamRateLimitError {
+    retry_after: Option<String>,
+}
+
+impl UpstreamRateLimitError {
+    pub(crate) fn new(retry_after: Option<String>) -> Self {
+        Self { retry_after }
+    }
+
+    pub fn retry_after(&self) -> Option<&str> {
+        self.retry_after.as_deref()
+    }
+}
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -321,6 +341,11 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
 
             // 成功响应
             if status.is_success() {
@@ -376,7 +401,11 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                last_error = if status.as_u16() == 429 {
+                    Some(UpstreamRateLimitError::new(retry_after).into())
+                } else {
+                    Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body))
+                };
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
@@ -516,6 +545,13 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            // `Response::text` 会消费 response，先保存 Retry-After。该值来自已通过
+            // HTTP header 校验的上游响应，适配层仍会在写回前再次校验。
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
 
             // 成功响应
             if status.is_success() {
@@ -639,33 +675,24 @@ impl KiroProvider {
                     body
                 );
 
-                let remaining = self.token_manager.report_account_throttled(ctx.id, cooldown);
+                self.token_manager.report_account_throttled(ctx.id, cooldown);
+                let remaining = self
+                    .token_manager
+                    .available_count_for_request(model.as_deref(), group);
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(429),
                     outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
-                    api_type,
-                    ctx.id,
-                    cooldown_secs / 60,
-                    status,
-                    body
-                ));
+                // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
+                // 让下游网关在同一时段内也停止调度该虚拟账号。
+                let rate_limit_error = UpstreamRateLimitError::new(
+                    retry_after.clone().or_else(|| Some(cooldown_secs.to_string())),
+                );
 
                 if remaining == 0 {
-                    anyhow::bail!(
-                        "{} API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。\
-                         上游对凭据 #{} 的账号触发了 \"suspicious activity\" 临时限速，\
-                         建议：(1) 增加更多不同 AWS 账号的凭据；\
-                         (2) 在管理面板降低冷却时长或手动解除冷却以重试；\
-                         (3) 提交 AWS Support 申诉解封该账号。原始响应: {} {}",
-                        api_type,
-                        ctx.id,
-                        status,
-                        body
-                    );
+                    return Err(rate_limit_error.into());
                 }
+                last_error = Some(rate_limit_error.into());
                 continue;
             }
 
@@ -722,12 +749,16 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::TRANSIENT, Some(&body), attempt_start,
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = if status.as_u16() == 429 {
+                    Some(UpstreamRateLimitError::new(retry_after).into())
+                } else {
+                    Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ))
+                };
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
