@@ -12,7 +12,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::stream::SseEvent;
@@ -358,27 +358,7 @@ fn generate_websearch_events(
 
     // 5. content_block_start (web_search_tool_result, index 2)
     // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let search_content = websearch_result_content(&search_results);
 
     events.push(SseEvent::new(
         "content_block_start",
@@ -499,11 +479,96 @@ pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchRes
     summary
 }
 
+fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Vec<Value> {
+    search_results
+        .as_ref()
+        .map(|results| {
+            results
+                .results
+                .iter()
+                .map(|result| {
+                    let page_age = result.published_date.and_then(|ms| {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                            .map(|dt| dt.format("%B %-d, %Y").to_string())
+                    });
+                    json!({
+                        "type": "web_search_result",
+                        "title": result.title,
+                        "url": result.url,
+                        "encrypted_content": result.snippet.clone().unwrap_or_default(),
+                        "page_age": page_age
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn build_websearch_content(
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+) -> Vec<Value> {
+    vec![
+        json!({"type": "text", "text": format!("I'll search for \"{}\".", query)}),
+        json!({
+            "id": tool_use_id,
+            "type": "server_tool_use",
+            "name": "web_search",
+            "input": {"query": query}
+        }),
+        json!({
+            "type": "web_search_tool_result",
+            "content": websearch_result_content(search_results)
+        }),
+        json!({"type": "text", "text": generate_search_summary(query, search_results)}),
+    ]
+}
+
+fn finish_mcp_call(
+    result: anyhow::Result<McpResponse>,
+) -> Result<Option<WebSearchResults>, Response> {
+    match result {
+        Ok(response) => Ok(parse_search_results(&response)),
+        Err(error) => {
+            tracing::warn!("MCP API 调用失败: {}", error);
+            Err(super::handlers::map_provider_error(error))
+        }
+    }
+}
+
+fn render_websearch_response(
+    stream_response: bool,
+    model: String,
+    query: String,
+    tool_use_id: String,
+    search_results: Option<WebSearchResults>,
+    input_tokens: i32,
+) -> Response {
+    if stream_response {
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    } else {
+        let content = build_websearch_content(&query, &tool_use_id, &search_results);
+        let summary = generate_search_summary(&query, &search_results);
+        let output_tokens = (summary.len() as i32 + 3) / 4;
+        super::websearch_loop::render_json(&model, content, "end_turn", input_tokens, output_tokens)
+    }
+}
+
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    group: Option<&str>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -526,38 +591,33 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
-        Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
-            None
-        }
+    let search_results = match finish_mcp_call(call_mcp_api(&provider, &mcp_request, group).await) {
+        Ok(results) => results,
+        Err(response) => return response,
     };
 
-    // 4. 生成 SSE 响应
-    let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    // 4. 按请求模式生成响应
+    render_websearch_response(
+        payload.stream,
+        payload.model.clone(),
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+    )
 }
 
 /// 调用 Kiro MCP API
 pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    group: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = provider.call_mcp(&request_body, group).await?;
 
     let body = response.text().await?;
     tracing::debug!("MCP response: {}", body);
@@ -578,6 +638,44 @@ pub(crate) async fn call_mcp_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mcp_rate_limit_is_not_converted_to_empty_results() {
+        let error = crate::kiro::error::UpstreamRateLimitError::new(Some("60".to_string()));
+        let response = finish_mcp_call(Err(error.into())).unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_websearch_response_is_json() {
+        let response = render_websearch_response(
+            false,
+            "claude-sonnet-4".to_string(),
+            "rust".to_string(),
+            "srvtoolu_test".to_string(),
+            None,
+            12,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert!(
+            body["content"].as_array().unwrap().iter().any(|block| {
+                block["type"] == "server_tool_use" && block["name"] == "web_search"
+            })
+        );
+    }
 
     #[test]
     fn test_has_web_search_tool_only_one() {

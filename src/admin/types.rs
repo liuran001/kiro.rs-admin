@@ -1173,6 +1173,10 @@ impl AdminErrorResponse {
         Self::new("api_error", message)
     }
 
+    pub fn rate_limit(message: impl Into<String>) -> Self {
+        Self::new("rate_limit_error", message)
+    }
+
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
     }
