@@ -43,6 +43,21 @@ pub struct TraceAttempt {
     pub duration_ms: u64,
 }
 
+/// 单个处理阶段的耗时打点
+///
+/// 用于把「首字之前 / 端到端」的总耗时拆成可分析的细粒度阶段：
+/// convert(请求转换) → serialize(序列化) → acquire(选凭据+刷 token) →
+/// profile_arn(解析 ARN) → execute(上游到首字) → metering(计量) → decode(流式解码)。
+/// provider 与 handler 在各阶段边界调用 [`TraceSink::on_stage`] 上报，按发生顺序累积。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceStage {
+    /// 阶段名（convert / serialize / acquire / profile_arn / execute / metering / decode）
+    pub name: String,
+    /// 该阶段耗时（毫秒）
+    pub duration_ms: u64,
+}
+
 /// 调用方使用的入口 Key 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +140,9 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 各处理阶段耗时（按发生顺序）；空表示未打点（老库/未启用）
+    #[serde(default)]
+    pub stages: Vec<TraceStage>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -159,9 +177,12 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
     Some(format!("{}…(truncated)", &trimmed[..end]))
 }
 
-/// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
+/// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]，
+/// 在各处理阶段边界调用 [`Self::on_stage`] 上报该阶段耗时。
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+    /// 上报一个处理阶段的耗时（按发生顺序累积）。默认空实现，便于旧 sink 无痛兼容。
+    fn on_stage(&self, _stage: TraceStage) {}
 }
 
 /// 查询过滤条件
@@ -254,7 +275,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 7] = [
+        let columns: [(&str, &str); 8] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -262,6 +283,7 @@ impl TraceStore {
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("stages", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -323,8 +345,8 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 credits, first_token_ms, stages) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -346,6 +368,12 @@ impl TraceStore {
                     rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
+                    // stages 以 JSON 文本落库；空数组存 NULL 省空间
+                    if rec.stages.is_empty() {
+                        None
+                    } else {
+                        serde_json::to_string(&rec.stages).ok()
+                    },
                 ],
             )?;
             // 用「发射顺序下标」作为 attempt 主键分量，而非 provider 的重试轮次计数：
@@ -482,7 +510,7 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, stages \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -509,6 +537,11 @@ impl TraceStore {
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                // stages 以 JSON 文本存储；解析失败或为空则退化为空数组（不影响其它字段）
+                stages: row
+                    .get::<_, Option<String>>(19)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
                 attempts: Vec::new(),
             })
         })?;
@@ -721,7 +754,8 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
-    first_token_ms    INTEGER
+    first_token_ms    INTEGER,
+    stages            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -781,6 +815,16 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            stages: vec![
+                TraceStage {
+                    name: "convert".to_string(),
+                    duration_ms: 3,
+                },
+                TraceStage {
+                    name: "execute".to_string(),
+                    duration_ms: 900,
+                },
+            ],
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -841,6 +885,12 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+        // stages 阶段耗时往返（JSON 列）
+        assert_eq!(out[0].stages.len(), 2);
+        assert_eq!(out[0].stages[0].name, "convert");
+        assert_eq!(out[0].stages[0].duration_ms, 3);
+        assert_eq!(out[0].stages[1].name, "execute");
+        assert_eq!(out[0].stages[1].duration_ms, 900);
     }
 
     #[test]

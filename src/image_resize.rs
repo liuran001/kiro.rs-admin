@@ -210,12 +210,24 @@ const IMAGE_TOKEN_FALLBACK: u32 = 1_600;
 /// 始终贡献非零 token —— 这对 prompt cache 的 creation/read 数值精度至关重要。
 ///
 /// `media_type` 形如 "image/png"；`data_base64` 是原始 base64 数据。
+///
+/// 带进程内结果缓存：同一张图片会在多轮对话的 history 里反复出现，而每次估算都要
+/// 对整段 base64 做一次 `BASE64.decode` 全量解码（`peek_dimensions`）。缓存 key 为
+/// `(media_type, data)` 的快速哈希，命中直接返回，避免 history 图片每轮重复解码
+/// （首字延迟随轮数增长的放大因素之一）。
 pub fn estimate_image_tokens(media_type: &str, data_base64: &str) -> u32 {
-    let format = media_type
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let key = image_token_cache_key(media_type, data_base64);
+    if let Some(tokens) = image_token_cache_get(key) {
+        return tokens;
+    }
+    let tokens = estimate_image_tokens_uncached(media_type, data_base64);
+    image_token_cache_put(key, tokens);
+    tokens
+}
+
+/// 实际的尺寸探测 + token 估算（不含缓存）。
+fn estimate_image_tokens_uncached(media_type: &str, data_base64: &str) -> u32 {
+    let format = media_type.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
     let Some((w, h)) = peek_dimensions(&format, data_base64) else {
         return IMAGE_TOKEN_FALLBACK;
     };
@@ -233,6 +245,38 @@ pub fn estimate_image_tokens(media_type: &str, data_base64: &str) -> u32 {
     }
     let tokens = (fw * fh / IMAGE_TOKEN_PIXELS_PER_TOKEN).round() as u32;
     tokens.max(1)
+}
+
+/// 图片 token 估算结果缓存容量上限（条目为 8B key + 4B value，占用极小）。
+const IMAGE_TOKEN_CACHE_CAP: usize = 512;
+
+/// 进程内图片 token 缓存：key = (media_type, data) 的 64bit 哈希，value = 估算 token。
+/// 用 std Mutex + HashMap；超容量时整体清空（简单够用，图片数据跨轮稳定，清空后
+/// 下一轮重新填充，不影响正确性）。
+static IMAGE_TOKEN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<u64, u32>>> =
+    std::sync::Mutex::new(None);
+
+fn image_token_cache_key(media_type: &str, data_base64: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    media_type.hash(&mut hasher);
+    data_base64.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn image_token_cache_get(key: u64) -> Option<u32> {
+    let guard = IMAGE_TOKEN_CACHE.lock().ok()?;
+    guard.as_ref().and_then(|m| m.get(&key).copied())
+}
+
+fn image_token_cache_put(key: u64, tokens: u32) {
+    if let Ok(mut guard) = IMAGE_TOKEN_CACHE.lock() {
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        if map.len() >= IMAGE_TOKEN_CACHE_CAP && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, tokens);
+    }
 }
 
 fn guess_format(s: &str) -> Option<ImageFormat> {
@@ -553,5 +597,18 @@ mod tests {
         let out = maybe_shrink_image(cfg, "png", &bogus);
         assert_eq!(out.format, "png", "undetectable bytes keep declared format");
         assert_eq!(out.data_base64, bogus);
+    }
+
+    #[test]
+    fn estimate_image_tokens_cache_returns_consistent_result() {
+        let png = make_png(800, 600);
+        // 首次估算（填充缓存）与二次估算（命中缓存）结果必须一致。
+        let first = estimate_image_tokens("image/png", &png);
+        let second = estimate_image_tokens("image/png", &png);
+        assert_eq!(first, second);
+        // 与不走缓存的直算结果一致，确认缓存未改变数值口径。
+        assert_eq!(first, estimate_image_tokens_uncached("image/png", &png));
+        // 800x600 未超长边上限：tokens = 800*600/750 = 640。
+        assert_eq!(first, 640);
     }
 }
