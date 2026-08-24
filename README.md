@@ -1,3 +1,5 @@
+<img width="522" height="143" alt="image" src="https://github.com/user-attachments/assets/75aa483f-541c-4739-b6a2-81daa30b8d89" />
+
 # kiro-rs
 
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
